@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 850" role="img" aria-labelledby="title desc">
+  <title id="title">Plane, sphere, and oriented-box recovery</title>
+  <desc id="desc">Three panels explain area-weighted plane segmentation and TLS, robust sphere fitting, and oriented-box recovery from opposite plane pairs. A final strip shows inferred geometric constraints.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" class="arrow-head"/>
+    </marker>
+  </defs>
+  <style>
+    .bg { fill: #ffffff; }
+    .panel { fill: #f6f8fa; stroke: #8c959f; stroke-width: 1.5; }
+    .title { fill: #1f2328; font: 700 24px "Segoe UI", sans-serif; }
+    .heading { fill: #1f2328; font: 700 18px "Segoe UI", sans-serif; }
+    .body { fill: #424a53; font: 14px "Segoe UI", sans-serif; }
+    .small { fill: #57606a; font: 14px "Segoe UI", sans-serif; }
+    .mono { fill: #1f2328; font: 14px Consolas, monospace; }
+    .plane { fill: #ddf4ff; stroke: #218bff; stroke-width: 2; }
+    .curved { fill: #fbefff; stroke: #a475f9; stroke-width: 2; }
+    .fit { fill: none; stroke: #d1242f; stroke-width: 3; }
+    .sample { fill: #a475f9; stroke: #ffffff; stroke-width: 1.5; }
+    .axis-x { stroke: #d1242f; }
+    .axis-y { stroke: #2da44e; }
+    .axis-z { stroke: #218bff; }
+    .axis { fill: none; stroke-width: 3; marker-end: url(#arrow); }
+    .flow { fill: none; stroke: #57606a; stroke-width: 2; marker-end: url(#arrow); }
+    .arrow-head { fill: #57606a; }
+    .formula { fill: #ffffff; stroke: #d0d7de; stroke-width: 1.2; }
+    .constraint { fill: #fff8c5; stroke: #bf8700; stroke-width: 1.5; }
+    .good { fill: #dafbe1; stroke: #2da44e; stroke-width: 1.5; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .panel { fill: #161b22; stroke: #6e7681; }
+      .title, .heading, .mono { fill: #f0f6fc; }
+      .body { fill: #c9d1d9; }
+      .small { fill: #8b949e; }
+      .plane { fill: #0c2d3f; stroke: #58a6ff; }
+      .curved { fill: #2d1f3f; stroke: #bc8cff; }
+      .fit { stroke: #f85149; }
+      .sample { fill: #bc8cff; stroke: #0d1117; }
+      .axis-x { stroke: #f85149; }
+      .axis-y { stroke: #3fb950; }
+      .axis-z { stroke: #58a6ff; }
+      .flow { stroke: #8b949e; }
+      .arrow-head { fill: #8b949e; }
+      .formula { fill: #0d1117; stroke: #30363d; }
+      .constraint { fill: #332b00; stroke: #d29922; }
+      .good { fill: #173b25; stroke: #3fb950; }
+    }
+  </style>
+
+  <rect class="bg" width="1440" height="850" rx="18"/>
+  <text class="title" x="48" y="48">Recovering analytic parameters from the repaired mesh</text>
+  <text class="small" x="48" y="73">The three fits are independent first; only relationships supported by residuals are constrained afterward.</text>
+
+  <!-- Plane panel. -->
+  <g transform="translate(48 105)">
+    <rect class="panel" width="424" height="565" rx="14"/>
+    <text class="heading" x="22" y="35">A · Deterministic plane segmentation</text>
+    <text class="small" x="22" y="60">Every non-degenerate triangle supplies one hypothesis.</text>
+    <polygon class="plane" points="43,128 146,91 167,191"/>
+    <polygon class="plane" points="146,91 264,131 167,191"/>
+    <polygon class="plane" points="264,131 354,183 167,191"/>
+    <polygon class="curved" points="43,128 167,191 82,248"/>
+    <polygon class="curved" points="82,248 167,191 188,280"/>
+    <line class="fit" x1="38" y1="201" x2="364" y2="96"/>
+    <text class="small" x="284" y="95">fitted support</text>
+    <rect class="formula" x="22" y="303" width="380" height="82" rx="9"/>
+    <text class="mono" x="37" y="330">|nₛ · nₜ| ≥ cos(0.75°)</text>
+    <text class="mono" x="37" y="358">maxⱼ |nₛ · pⱼ + dₛ| ≤ τplane</text>
+    <text class="body" x="22" y="420">Select the largest edge-connected support by</text>
+    <text class="body" x="22" y="443">triangle area, refit by TLS, and reclassify.</text>
+    <text class="small" x="22" y="477">TLS integrates triangle surface moments; it does not</text>
+    <text class="small" x="22" y="497">over-count duplicated or densely tessellated vertices.</text>
+    <rect class="good" x="22" y="518" width="380" height="30" rx="7"/>
+    <text class="small" x="34" y="538">Merge coincident supports across disconnected patches.</text>
+  </g>
+
+  <!-- Sphere panel. -->
+  <g transform="translate(508 105)">
+    <rect class="panel" width="424" height="565" rx="14"/>
+    <text class="heading" x="22" y="35">B · Robust sphere fit</text>
+    <text class="small" x="22" y="60">Use unique vertices incident to the non-planar region.</text>
+    <circle class="fit" cx="206" cy="188" r="103"/>
+    <circle class="sample" cx="118" cy="136" r="6"/><circle class="sample" cx="146" cy="101" r="6"/>
+    <circle class="sample" cx="198" cy="85" r="6"/><circle class="sample" cx="252" cy="96" r="6"/>
+    <circle class="sample" cx="290" cy="128" r="6"/><circle class="sample" cx="308" cy="181" r="6"/>
+    <circle class="sample" cx="294" cy="235" r="6"/><circle class="sample" cx="259" cy="270" r="6"/>
+    <circle class="sample" cx="203" cy="291" r="6"/><circle class="sample" cx="151" cy="273" r="6"/>
+    <circle class="sample" cx="116" cy="235" r="6"/><circle class="sample" cx="102" cy="184" r="6"/>
+    <circle cx="206" cy="188" r="5" fill="#d1242f"/>
+    <path class="flow" d="M206 188 L291 130"/>
+    <text class="mono" x="220" y="164">rᵢ = ‖pᵢ−C‖−R</text>
+    <rect class="formula" x="22" y="319" width="380" height="92" rx="9"/>
+    <text class="mono" x="37" y="344">[2x 2y 2z 1] θ = x²+y²+z²</text>
+    <text class="mono" x="37" y="368">θ = [Cx Cy Cz k]ᵀ</text>
+    <text class="small" x="37" y="393">weighted QR → Huber IRLS + Levenberg–Marquardt</text>
+    <text class="body" x="22" y="447">Vertex weight = one third of incident curved</text>
+    <text class="body" x="22" y="470">triangle area. Seam vertices remain included.</text>
+    <text class="small" x="22" y="504">Angular coverage rejects a poorly constrained fit;</text>
+    <text class="small" x="22" y="524">radial normal orientation is reported as a diagnostic.</text>
+  </g>
+
+  <!-- Box panel. -->
+  <g transform="translate(968 105)">
+    <rect class="panel" width="424" height="565" rx="14"/>
+    <text class="heading" x="22" y="35">C · Oriented-box inference</text>
+    <text class="small" x="22" y="60">Search three disjoint opposite support-plane pairs.</text>
+    <g transform="translate(42 62) scale(0.8)">
+      <path class="plane" d="M80 217 L181 110 L331 153 L226 268 Z"/>
+      <path class="plane" d="M80 217 L80 117 L181 34 L181 110 Z" opacity="0.75"/>
+      <path class="plane" d="M181 110 L181 34 L331 79 L331 153 Z" opacity="0.55"/>
+      <path class="axis axis-x" d="M205 183 L351 224"/>
+      <path class="axis axis-y" d="M205 183 L112 282"/>
+      <path class="axis axis-z" d="M205 183 L205 69"/>
+      <text class="small" x="354" y="230">u₀</text><text class="small" x="93" y="298">u₁</text><text class="small" x="211" y="71">u₂</text>
+    </g>
+    <rect class="formula" x="22" y="319" width="380" height="92" rx="9"/>
+    <text class="mono" x="37" y="346">parallel pairs → orthogonal triples</text>
+    <text class="mono" x="37" y="371">U ≈ polar/SVD(frame) ∈ SO(3)</text>
+    <text class="mono" x="37" y="396">dimᵢ = highᵢ − lowᵢ</text>
+    <text class="body" x="22" y="447">Offsets are area-weighted projection medians.</text>
+    <text class="body" x="22" y="470">All-vertex containment violations are penalized.</text>
+    <text class="small" x="22" y="504">The score rewards explained area and penalizes</text>
+    <text class="small" x="22" y="524">non-orthogonality, residual, and containment error.</text>
+  </g>
+
+  <!-- Constraint strip. -->
+  <g transform="translate(48 706)">
+    <rect class="constraint" width="1344" height="104" rx="13"/>
+    <text class="heading" x="22" y="34">D · Constraint refinement inferred from fitted relations</text>
+    <text class="mono" x="22" y="65">τsnap = max(2·10⁻⁵L, 32·sphereMaxResidual, 16·εfloat·L)</text>
+    <text class="body" x="622" y="64">Near midpoint + R ≈ half-span → opposite tangency</text>
+    <text class="body" x="622" y="87">Center near a support → center-on-plane relation</text>
+    <text class="small" x="22" y="89">Snapping only these evidenced relations prevents tiny OCCT gaps or sliver faces.</text>
+  </g>
+</svg>

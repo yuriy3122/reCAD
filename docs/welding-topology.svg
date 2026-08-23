@@ -1,0 +1,131 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 720" role="img" aria-labelledby="title desc">
+  <title id="title">Position welding and topology repair</title>
+  <desc id="desc">The raw GLB uses separate vertex records for every triangle. Signed-zero-safe spatial welding merges coincident positions, after which edge incidence builds adjacency and winding is repaired.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" class="arrow-head"/>
+    </marker>
+    <pattern id="grid" width="42" height="42" patternUnits="userSpaceOnUse">
+      <path d="M42 0H0V42" class="grid-line"/>
+    </pattern>
+  </defs>
+  <style>
+    .bg { fill: #ffffff; }
+    .panel { fill: #f6f8fa; stroke: #8c959f; stroke-width: 1.5; }
+    .title { fill: #1f2328; font: 700 24px "Segoe UI", sans-serif; }
+    .heading { fill: #1f2328; font: 700 18px "Segoe UI", sans-serif; }
+    .body { fill: #424a53; font: 14px "Segoe UI", sans-serif; }
+    .small { fill: #57606a; font: 14px "Segoe UI", sans-serif; }
+    .mono { fill: #1f2328; font: 14px Consolas, monospace; }
+    .tri-a { fill: #ddf4ff; stroke: #218bff; stroke-width: 2; }
+    .tri-b { fill: #dafbe1; stroke: #2da44e; stroke-width: 2; }
+    .tri-c { fill: #fbefff; stroke: #a475f9; stroke-width: 2; }
+    .node-a { fill: #218bff; stroke: #ffffff; stroke-width: 2; }
+    .node-b { fill: #2da44e; stroke: #ffffff; stroke-width: 2; }
+    .node-c { fill: #a475f9; stroke: #ffffff; stroke-width: 2; }
+    .node-weld { fill: #d1242f; stroke: #ffffff; stroke-width: 2; }
+    .grid-line { fill: none; stroke: #d0d7de; stroke-width: 1; }
+    .cell { fill: #fff8c5; stroke: #bf8700; stroke-width: 2; }
+    .flow { fill: none; stroke: #57606a; stroke-width: 2.5; marker-end: url(#arrow); }
+    .arrow-head { fill: #57606a; }
+    .callout { fill: #fff1e5; stroke: #d97706; stroke-width: 1.5; }
+    .ok { fill: #dafbe1; stroke: #2da44e; stroke-width: 1.5; }
+    .edge { stroke: #1f2328; stroke-width: 3; fill: none; }
+    .edge-dashed { stroke: #d1242f; stroke-width: 2; stroke-dasharray: 6 5; fill: none; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .panel { fill: #161b22; stroke: #6e7681; }
+      .title, .heading, .mono { fill: #f0f6fc; }
+      .body { fill: #c9d1d9; }
+      .small { fill: #8b949e; }
+      .tri-a { fill: #0c2d3f; stroke: #58a6ff; }
+      .tri-b { fill: #173b25; stroke: #3fb950; }
+      .tri-c { fill: #2d1f3f; stroke: #bc8cff; }
+      .node-a { fill: #58a6ff; stroke: #0d1117; }
+      .node-b { fill: #3fb950; stroke: #0d1117; }
+      .node-c { fill: #bc8cff; stroke: #0d1117; }
+      .node-weld { fill: #f85149; stroke: #0d1117; }
+      .grid-line { stroke: #30363d; }
+      .cell { fill: #332b00; stroke: #d29922; }
+      .flow { stroke: #8b949e; }
+      .arrow-head { fill: #8b949e; }
+      .callout { fill: #3a2917; stroke: #d29922; }
+      .ok { fill: #173b25; stroke: #3fb950; }
+      .edge { stroke: #f0f6fc; }
+      .edge-dashed { stroke: #f85149; }
+    }
+  </style>
+
+  <rect class="bg" width="1440" height="720" rx="18"/>
+  <text class="title" x="48" y="48">Why geometric welding must precede adjacency</text>
+  <text class="small" x="48" y="73">The source indices are fully deindexed: topology exists in position space, not in the accessor indices.</text>
+
+  <!-- Raw soup. -->
+  <g transform="translate(48 105)">
+    <rect class="panel" width="390" height="424" rx="14"/>
+    <text class="heading" x="22" y="35">1 · Raw GLB triangle soup</text>
+    <text class="small" x="22" y="60">Every colored face owns three vertex records.</text>
+    <polygon class="tri-a" points="72,135 188,82 205,232"/>
+    <polygon class="tri-b" points="190,82 318,145 205,234"/>
+    <polygon class="tri-c" points="74,137 207,236 96,310"/>
+    <circle class="node-a" cx="72" cy="135" r="8"/><circle class="node-a" cx="188" cy="82" r="8"/><circle class="node-a" cx="205" cy="232" r="8"/>
+    <circle class="node-b" cx="190" cy="82" r="8"/><circle class="node-b" cx="318" cy="145" r="8"/><circle class="node-b" cx="205" cy="234" r="8"/>
+    <circle class="node-c" cx="74" cy="137" r="8"/><circle class="node-c" cx="207" cy="236" r="8"/><circle class="node-c" cx="96" cy="310" r="8"/>
+    <path class="edge-dashed" d="M188 82L190 82 M205 232L205 234 M72 135L74 137"/>
+    <rect class="callout" x="22" y="338" width="346" height="62" rx="9"/>
+    <text class="body" x="38" y="363">Exact bits also split +0.0 from −0.0.</text>
+    <text class="small" x="38" y="386">Naive result: 6,662 isolated triangles.</text>
+  </g>
+
+  <path class="flow" d="M450 317 H490"/>
+
+  <!-- Hash and tolerance. -->
+  <g transform="translate(502 105)">
+    <rect class="panel" width="410" height="424" rx="14"/>
+    <text class="heading" x="22" y="35">2 · Scale-aware spatial weld</text>
+    <text class="small" x="22" y="60">Canonicalize signed zero, then search adjacent cells.</text>
+    <rect x="38" y="83" width="294" height="210" fill="url(#grid)" stroke="#8c959f"/>
+    <rect class="cell" x="80" y="125" width="126" height="126" opacity="0.58"/>
+    <circle class="node-a" cx="143" cy="188" r="8"/>
+    <circle class="node-b" cx="149" cy="184" r="8"/>
+    <circle class="node-c" cx="140" cy="194" r="8"/>
+    <circle class="node-weld" cx="143" cy="188" r="17" fill-opacity="0.22"/>
+    <text class="small" x="219" y="154">27 cells in 3D</text>
+    <text class="small" x="219" y="176">nearest match</text>
+    <text class="small" x="219" y="198">within τ<tspan baseline-shift="sub">weld</tspan></text>
+    <text class="mono" x="22" y="328">base = max(τmin, 10⁻⁹L, 4·ULPfloat)</text>
+    <text class="mono" x="22" y="354">τw = max(τmin, min(base, 10⁻⁴·medEdge))</text>
+    <text class="small" x="22" y="385">27-neighbor lookup avoids cell-boundary misses;</text>
+    <text class="small" x="22" y="405">nearest-index tie breaking keeps results deterministic.</text>
+  </g>
+
+  <path class="flow" d="M924 317 H964"/>
+
+  <!-- Welded topology. -->
+  <g transform="translate(976 105)">
+    <rect class="panel" width="416" height="424" rx="14"/>
+    <text class="heading" x="22" y="35">3 · Rebuild and orient topology</text>
+    <text class="small" x="22" y="60">Shared vertex IDs expose shared undirected edges.</text>
+    <polygon class="tri-a" points="68,143 196,83 208,231"/>
+    <polygon class="tri-b" points="196,83 336,151 208,231"/>
+    <polygon class="tri-c" points="68,143 208,231 93,313"/>
+    <path class="edge" d="M68 143L196 83L336 151L208 231L93 313L68 143 M196 83L208 231L68 143 M208 231L93 313"/>
+    <circle class="node-weld" cx="68" cy="143" r="8"/><circle class="node-weld" cx="196" cy="83" r="8"/>
+    <circle class="node-weld" cx="336" cy="151" r="8"/><circle class="node-weld" cx="208" cy="231" r="8"/><circle class="node-weld" cx="93" cy="313" r="8"/>
+    <path class="flow" d="M151 139 Q174 119 191 117"/>
+    <path class="flow" d="M275 158 Q250 179 225 198"/>
+    <text class="small" x="236" y="286">BFS enforces opposite</text>
+    <text class="small" x="236" y="305">edge traversal.</text>
+    <rect class="ok" x="22" y="338" width="372" height="62" rx="9"/>
+    <text class="body" x="38" y="363">Closed components: orient by signed volume.</text>
+    <text class="small" x="38" y="386">Then count boundary / manifold / non-manifold edges.</text>
+  </g>
+
+  <!-- Observed result strip. -->
+  <g transform="translate(48 558)">
+    <rect class="ok" width="1344" height="112" rx="13"/>
+    <text class="heading" x="22" y="34">Observed on box_sphere_test-01.glb</text>
+    <text class="mono" x="22" y="66">19,986 raw positions  →  3,333 welded vertices  ·  6,662 triangles  ·  9,993 edges</text>
+    <text class="mono" x="22" y="91">1 connected component  ·  0 boundary edges  ·  0 non-manifold edges  ·  Euler χ = 2</text>
+  </g>
+</svg>

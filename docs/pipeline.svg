@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 650" role="img" aria-labelledby="title desc">
+  <title id="title">reCAD reconstruction pipeline</title>
+  <desc id="desc">A flow diagram from GLB triangle soup through mesh welding, CUDA feature extraction, analytic fitting, OpenCascade Boolean candidates, bidirectional scoring, and BREP and STEP export. SAT is isolated until reconstruction is complete.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-opacity="0.13"/>
+    </filter>
+  </defs>
+  <style>
+    .bg { fill: #ffffff; }
+    .card { fill: #f6f8fa; stroke: #8c959f; stroke-width: 1.5; filter: url(#shadow); }
+    .card-blue { fill: #ddf4ff; stroke: #218bff; }
+    .card-green { fill: #dafbe1; stroke: #2da44e; }
+    .card-purple { fill: #fbefff; stroke: #a475f9; }
+    .card-orange { fill: #fff1e5; stroke: #d97706; }
+    .title { fill: #1f2328; font: 700 24px "Segoe UI", sans-serif; }
+    .stage { fill: #1f2328; font: 700 17px "Segoe UI", sans-serif; }
+    .body { fill: #424a53; font: 14px "Segoe UI", sans-serif; }
+    .small { fill: #57606a; font: 14px "Segoe UI", sans-serif; }
+    .mono { fill: #1f2328; font: 14px Consolas, monospace; }
+    .flow { fill: none; stroke: #57606a; stroke-width: 2.5; marker-end: url(#arrow); }
+    .soft-flow { fill: none; stroke: #8c959f; stroke-width: 2; stroke-dasharray: 7 6; marker-end: url(#arrow); }
+    .arrow-head { fill: #57606a; }
+    .number { fill: #ffffff; font: 700 14px "Segoe UI", sans-serif; text-anchor: middle; dominant-baseline: middle; }
+    .number-dot { fill: #0969da; }
+    .guard { fill: #fff8c5; stroke: #bf8700; stroke-width: 1.5; stroke-dasharray: 7 5; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .card { fill: #161b22; stroke: #6e7681; }
+      .card-blue { fill: #0c2d3f; stroke: #58a6ff; }
+      .card-green { fill: #173b25; stroke: #3fb950; }
+      .card-purple { fill: #2d1f3f; stroke: #bc8cff; }
+      .card-orange { fill: #3a2917; stroke: #d29922; }
+      .title, .stage, .mono { fill: #f0f6fc; }
+      .body { fill: #c9d1d9; }
+      .small { fill: #8b949e; }
+      .flow { stroke: #8b949e; }
+      .soft-flow { stroke: #6e7681; }
+      .arrow-head { fill: #8b949e; }
+      .number-dot { fill: #1f6feb; }
+      .guard { fill: #332b00; stroke: #d29922; }
+    }
+  </style>
+
+  <rect class="bg" width="1440" height="650" rx="18"/>
+  <text class="title" x="48" y="48">From triangle soup to a verified analytic solid</text>
+  <text class="small" x="48" y="73">Every reconstruction decision is derived from the GLB; the optional SAT file remains behind a hard post-export boundary.</text>
+
+  <!-- Top row: measured data to analytic parameters. -->
+  <g transform="translate(48 112)">
+    <rect class="card card-blue" width="226" height="168" rx="14"/>
+    <circle class="number-dot" cx="27" cy="27" r="16"/><text class="number" x="27" y="27">1</text>
+    <text class="stage" x="52" y="32">Decode GLB</text>
+    <text class="body" x="20" y="69">Scene traversal + transforms</text>
+    <text class="body" x="20" y="94">Accessor stride / sparse data</text>
+    <text class="body" x="20" y="119">Float positions → double</text>
+    <text class="small" x="20" y="148">Output: indexed triangle soup</text>
+  </g>
+  <path class="flow" d="M 282 196 H 314"/>
+
+  <g transform="translate(322 112)">
+    <rect class="card card-blue" width="226" height="168" rx="14"/>
+    <circle class="number-dot" cx="27" cy="27" r="16"/><text class="number" x="27" y="27">2</text>
+    <text class="stage" x="52" y="32">Repair topology</text>
+    <text class="body" x="20" y="69">Scale-aware position weld</text>
+    <text class="body" x="20" y="94">27-cell neighbor search</text>
+    <text class="body" x="20" y="119">Adjacency + winding repair</text>
+    <text class="small" x="20" y="148">Output: topology-aware mesh</text>
+  </g>
+  <path class="flow" d="M 556 196 H 588"/>
+
+  <g transform="translate(596 112)">
+    <rect class="card card-purple" width="226" height="168" rx="14"/>
+    <circle class="number-dot" cx="27" cy="27" r="16"/><text class="number" x="27" y="27">3</text>
+    <text class="stage" x="52" y="32">CUDA features</text>
+    <text class="body" x="20" y="69">Normals, areas, centroids</text>
+    <text class="body" x="20" y="94">Plane + sphere residuals</text>
+    <text class="body" x="20" y="119">Weighted GPU reductions</text>
+    <text class="small" x="20" y="148">Double-precision geometry</text>
+  </g>
+  <path class="flow" d="M 830 196 H 862"/>
+
+  <g transform="translate(870 112)">
+    <rect class="card card-green" width="226" height="168" rx="14"/>
+    <circle class="number-dot" cx="27" cy="27" r="16"/><text class="number" x="27" y="27">4</text>
+    <text class="stage" x="52" y="32">Fit analytics</text>
+    <text class="body" x="20" y="69">Area-weighted planes</text>
+    <text class="body" x="20" y="94">Robust sphere fit</text>
+    <text class="body" x="20" y="119">Oriented box inference</text>
+    <text class="small" x="20" y="148">No axis or size constants</text>
+  </g>
+  <path class="flow" d="M 1104 196 H 1136"/>
+
+  <g transform="translate(1144 112)">
+    <rect class="card card-green" width="248" height="168" rx="14"/>
+    <circle class="number-dot" cx="27" cy="27" r="16"/><text class="number" x="27" y="27">5</text>
+    <text class="stage" x="52" y="32">Refine constraints</text>
+    <text class="body" x="20" y="69">Infer support tangencies</text>
+    <text class="body" x="20" y="94">Snap near-coincident relations</text>
+    <text class="body" x="20" y="119">Avoid Boolean micro-slivers</text>
+    <text class="small" x="20" y="148">Thresholds follow scale + fit error</text>
+  </g>
+
+  <!-- Lower row: construct and decide. -->
+  <path class="flow" d="M 1268 288 V 325 H 1100 V 355"/>
+  <g transform="translate(808 354)">
+    <rect class="card card-orange" width="584" height="128" rx="14"/>
+    <circle class="number-dot" cx="27" cy="27" r="16"/><text class="number" x="27" y="27">6</text>
+    <text class="stage" x="52" y="32">Build and filter all OCCT candidates</text>
+    <g transform="translate(22 55)">
+      <rect class="card" width="160" height="48" rx="9"/><text class="stage" x="80" y="30" text-anchor="middle">CUT</text>
+      <rect class="card" x="190" width="160" height="48" rx="9"/><text class="stage" x="270" y="30" text-anchor="middle">FUSE</text>
+      <rect class="card" x="380" width="160" height="48" rx="9"/><text class="stage" x="460" y="30" text-anchor="middle">COMMON</text>
+    </g>
+  </g>
+  <path class="flow" d="M 800 418 H 755"/>
+
+  <g transform="translate(418 354)">
+    <rect class="card card-purple" width="330" height="128" rx="14"/>
+    <circle class="number-dot" cx="27" cy="27" r="16"/><text class="number" x="27" y="27">7</text>
+    <text class="stage" x="52" y="32">Compare in both directions</text>
+    <text class="body" x="20" y="66">GLB centroids → exact BRep boundary</text>
+    <text class="body" x="20" y="91">Exact BRep samples → triangle BVH</text>
+    <text class="small" x="20" y="113">RMS + maximum + bounding-box error</text>
+  </g>
+  <path class="flow" d="M 410 418 H 365"/>
+
+  <g transform="translate(48 354)">
+    <rect class="card card-green" width="310" height="128" rx="14"/>
+    <circle class="number-dot" cx="27" cy="27" r="16"/><text class="number" x="27" y="27">8</text>
+    <text class="stage" x="52" y="32">Select, validate, export</text>
+    <text class="body" x="20" y="66">Lowest finite normalized score</text>
+    <text class="body" x="20" y="91">Closed one-solid analytic topology</text>
+    <text class="small" x="20" y="113">First write: BREP · STEP · PLY</text>
+  </g>
+
+  <path class="soft-flow" d="M 203 490 V 528"/>
+  <g transform="translate(48 530)">
+    <rect class="guard" width="1344" height="82" rx="13"/>
+    <text class="stage" x="24" y="31">SAT isolation barrier and status-only check</text>
+    <text class="body" x="24" y="57">After BREP/STEP: record SAT filename presence, then write JSON/report. No translator is integrated; no SAT content enters fitting, scoring, or selection.</text>
+  </g>
+</svg>

@@ -1,0 +1,7 @@
+/build/
+/output/
+/.deps/
+/.vs/
+*.user
+*.suo
+*.obj

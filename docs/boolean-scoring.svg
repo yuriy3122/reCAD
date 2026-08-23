@@ -1,0 +1,155 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 820" role="img" aria-labelledby="title desc">
+  <title id="title">OpenCascade Boolean selection and bidirectional scoring</title>
+  <desc id="desc">Recovered box and sphere primitives produce CUT, FUSE, and COMMON candidates. Invalid topology is filtered, both mesh-to-BRep and BRep-to-mesh distances are evaluated, and the lowest normalized score is exported.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" class="arrow-head"/>
+    </marker>
+    <marker id="arrowBoth" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 Z" class="arrow-head"/>
+    </marker>
+  </defs>
+  <style>
+    .bg { fill: #ffffff; }
+    .panel { fill: #f6f8fa; stroke: #8c959f; stroke-width: 1.5; }
+    .candidate { fill: #fff1e5; stroke: #d97706; stroke-width: 1.5; }
+    .scorebox { fill: #fbefff; stroke: #a475f9; stroke-width: 1.5; }
+    .good { fill: #dafbe1; stroke: #2da44e; stroke-width: 1.5; }
+    .guard { fill: #fff8c5; stroke: #bf8700; stroke-width: 1.5; }
+    .title { fill: #1f2328; font: 700 24px "Segoe UI", sans-serif; }
+    .heading { fill: #1f2328; font: 700 18px "Segoe UI", sans-serif; }
+    .body { fill: #424a53; font: 14px "Segoe UI", sans-serif; }
+    .small { fill: #57606a; font: 14px "Segoe UI", sans-serif; }
+    .mono { fill: #1f2328; font: 14px Consolas, monospace; }
+    .flow { fill: none; stroke: #57606a; stroke-width: 2.5; marker-end: url(#arrow); }
+    .both { fill: none; stroke: #a475f9; stroke-width: 2.5; marker-start: url(#arrowBoth); marker-end: url(#arrowBoth); }
+    .arrow-head { fill: #57606a; }
+    .box { fill: #ddf4ff; stroke: #218bff; stroke-width: 2; }
+    .sphere { fill: #fbefff; stroke: #a475f9; stroke-width: 2; }
+    .cut { fill: #ffffff; stroke: #d1242f; stroke-width: 2; }
+    .mesh { fill: none; stroke: #218bff; stroke-width: 2; }
+    .brep { fill: none; stroke: #2da44e; stroke-width: 3; }
+    .sample { fill: #a475f9; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .panel { fill: #161b22; stroke: #6e7681; }
+      .candidate { fill: #3a2917; stroke: #d29922; }
+      .scorebox { fill: #2d1f3f; stroke: #bc8cff; }
+      .good { fill: #173b25; stroke: #3fb950; }
+      .guard { fill: #332b00; stroke: #d29922; }
+      .title, .heading, .mono { fill: #f0f6fc; }
+      .body { fill: #c9d1d9; }
+      .small { fill: #8b949e; }
+      .flow { stroke: #8b949e; }
+      .both { stroke: #bc8cff; }
+      .arrow-head { fill: #8b949e; }
+      .box { fill: #0c2d3f; stroke: #58a6ff; }
+      .sphere { fill: #2d1f3f; stroke: #bc8cff; }
+      .cut { fill: #0d1117; stroke: #f85149; }
+      .mesh { stroke: #58a6ff; }
+      .brep { stroke: #3fb950; }
+      .sample { fill: #bc8cff; }
+    }
+  </style>
+
+  <rect class="bg" width="1440" height="820" rx="18"/>
+  <text class="title" x="48" y="48">Boolean choice is measured, never assumed</text>
+  <text class="small" x="48" y="73">The curved-surface orientation is diagnostic only; CUT, FUSE, and COMMON all pass through the same validation and score.</text>
+
+  <!-- Primitive inputs. -->
+  <g transform="translate(48 108)">
+    <rect class="panel" width="238" height="170" rx="14"/>
+    <text class="heading" x="20" y="34">Analytic inputs</text>
+    <path class="box" d="M55 105 L112 69 L186 90 L126 128 Z M55 105 V63 L112 31 L112 69 M112 31 L186 52 V90 M55 63 L126 84 L186 52 M126 84 V128"/>
+    <circle class="sphere" cx="143" cy="95" r="42" opacity="0.72"/>
+    <text class="small" x="20" y="151">Recovered box + sphere</text>
+  </g>
+  <path class="flow" d="M298 193 H346"/>
+
+  <!-- Candidates. -->
+  <g transform="translate(358 108)">
+    <rect class="candidate" width="260" height="170" rx="14"/>
+    <text class="heading" x="20" y="34">CUT</text>
+    <rect class="box" x="57" y="61" width="130" height="79" rx="2"/>
+    <path class="cut" d="M120 61 A53 53 0 0 0 187 128 L187 61 Z"/>
+    <text class="small" x="20" y="156">box − sphere</text>
+  </g>
+  <g transform="translate(640 108)">
+    <rect class="candidate" width="260" height="170" rx="14"/>
+    <text class="heading" x="20" y="34">FUSE</text>
+    <rect class="box" x="47" y="67" width="126" height="73" rx="2"/>
+    <circle class="sphere" cx="166" cy="91" r="49" opacity="0.72"/>
+    <text class="small" x="20" y="156">box ∪ sphere</text>
+  </g>
+  <g transform="translate(922 108)">
+    <rect class="candidate" width="260" height="170" rx="14"/>
+    <text class="heading" x="20" y="34">COMMON</text>
+    <rect class="box" x="49" y="67" width="126" height="73" rx="2" opacity="0.35"/>
+    <path class="sphere" d="M112 67 A49 49 0 0 0 175 133 V67 Z"/>
+    <text class="small" x="20" y="156">box ∩ sphere</text>
+  </g>
+
+  <path class="flow" d="M1194 193 H1242"/>
+  <g transform="translate(1254 108)">
+    <rect class="guard" width="138" height="170" rx="14"/>
+    <text class="heading" x="16" y="34">Per candidate</text>
+    <text class="small" x="16" y="67">valid shape</text>
+    <text class="small" x="16" y="89">closed shell</text>
+    <text class="small" x="16" y="111">one solid</text>
+    <text class="small" x="16" y="133">analytic faces</text>
+    <text class="small" x="16" y="155">no other surfaces</text>
+  </g>
+
+  <!-- Distance explanation. -->
+  <g transform="translate(48 324)">
+    <rect class="panel" width="860" height="304" rx="14"/>
+    <text class="heading" x="22" y="35">Bidirectional geometry comparison for every surviving candidate</text>
+
+    <g transform="translate(48 78)">
+      <text class="body" x="0" y="0">Input GLB triangles</text>
+      <path class="mesh" d="M2 112 L54 45 L116 104 L166 34 L212 116 M2 112 L116 104 L212 116 M54 45 L116 104 L166 34"/>
+      <circle class="sample" cx="57" cy="87" r="5"/><circle class="sample" cx="141" cy="85" r="5"/>
+      <text class="small" x="0" y="145">area-weighted centroids</text>
+      <text class="small" x="0" y="165">+ all vertices for maximum</text>
+    </g>
+
+    <path class="both" d="M320 162 H532"/>
+    <text class="small" x="348" y="137">exact point ↔ surface</text>
+    <text class="small" x="350" y="191">analytic sample ↔ BVH</text>
+
+    <g transform="translate(588 78)">
+      <text class="body" x="0" y="0">Candidate BRep faces</text>
+      <path class="brep" d="M6 116 C34 35 162 21 218 109"/>
+      <path class="brep" d="M6 116 H218"/>
+      <circle class="sample" cx="61" cy="65" r="5"/><circle class="sample" cx="148" cy="51" r="5"/>
+      <text class="small" x="0" y="145">OCCT tessellation nodes</text>
+      <text class="small" x="0" y="165">+ exact UV-centroid samples</text>
+    </g>
+
+    <text class="mono" x="22" y="276">symmetricRMS = √((RMS²GLB→BRep + RMS²BRep→GLB) / 2)</text>
+  </g>
+
+  <!-- Score and selection. -->
+  <g transform="translate(938 324)">
+    <rect class="scorebox" width="454" height="188" rx="14"/>
+    <text class="heading" x="22" y="35">Normalized candidate score</text>
+    <text class="mono" x="22" y="76">score = symmetricRMS / L</text>
+    <text class="mono" x="70" y="103">+ 0.10 · max(max_G→B, max_B→G) / L</text>
+    <text class="mono" x="70" y="130">+ 0.25 · boundingBoxError / L</text>
+    <text class="small" x="22" y="162">Lower is better. Invalid candidates have score = ∞.</text>
+  </g>
+  <path class="flow" d="M1165 521 V564"/>
+  <g transform="translate(938 576)">
+    <rect class="good" width="454" height="112" rx="14"/>
+    <text class="heading" x="22" y="35">Selected analytic solid</text>
+    <text class="body" x="22" y="65">Require plane + sphere faces and a circular edge.</text>
+    <text class="small" x="22" y="90">Then write BREP, STEP, JSON, report, and segmentation PLY.</text>
+  </g>
+
+  <g transform="translate(48 665)">
+    <rect class="guard" width="860" height="103" rx="13"/>
+    <text class="heading" x="22" y="34">Distance semantics</text>
+    <text class="body" x="22" y="63">The comparison samples triangle interiors and exact analytic faces, so it sees chordal sag that a vertex-only check misses.</text>
+    <text class="small" x="22" y="87">It is symmetric but remains a sampled approximation—not a formal Hausdorff bound.</text>
+  </g>
+</svg>
