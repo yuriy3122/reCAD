@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{E586F591-9D9E-4A75-9636-C17C4AC14F28}</ProjectGuid>
+    <RootNamespace>reCAD</RootNamespace>
+    <ProjectName>reCAD</ProjectName>
+    <RecadRoot>$(MSBuildThisFileDirectory)</RecadRoot>
+    <TargetName>mesh2brep</TargetName>
+  </PropertyGroup>
+  <Import Project="vs\NativeProject.props" />
+  <PropertyGroup>
+    <LocalDebuggerCommandArguments>--input "$(RecadRoot)testData\box_sphere_test-01.glb" --input-scale 1 --output "$(RecadRoot)output\debug-run"</LocalDebuggerCommandArguments>
+  </PropertyGroup>
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\MeshLoader.cpp" />
+    <ClCompile Include="src\Geometry.cpp" />
+    <ClCompile Include="src\Distance.cpp" />
+    <ClCompile Include="src\CadReconstruction.cpp" />
+    <ClCompile Include="src\SurfaceFitting.cpp" />
+    <ClCompile Include="src\PatchReconstruction.cpp" />
+    <ClCompile Include="src\GeneralReconstruction.cpp" />
+    <ClCompile Include="src\ReferenceValidation.cpp" />
+    <CudaCompile Include="src\CudaGeometry.cu" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\Geometry.h" />
+    <ClInclude Include="include\MeshLoader.h" />
+    <ClInclude Include="include\Distance.h" />
+    <ClInclude Include="include\CudaGeometry.h" />
+    <ClInclude Include="include\CadReconstruction.h" />
+    <ClInclude Include="include\SurfaceFitting.h" />
+    <ClInclude Include="include\PatchReconstruction.h" />
+    <ClInclude Include="include\GeneralReconstruction.h" />
+    <ClInclude Include="include\ReferenceValidation.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="README.md" />
+    <None Include="vcpkg.json" />
+    <None Include="vs\NativeProject.props" />
+    <None Include="vs\NativeProject.targets" />
+    <None Include="scripts\bootstrap-dependencies.ps1" />
+    <None Include="scripts\build-vs2026.ps1" />
+    <None Include="tests\run-integration.ps1" />
+    <None Include="tests\run-samples.ps1" />
+  </ItemGroup>
+  <Import Project="vs\NativeProject.targets" />
+</Project>
