@@ -48,14 +48,16 @@ private:
 };
 
 [[nodiscard]] DistanceStatistics meshToBrepDistance(
-    const Mesh& mesh, const TopoDS_Shape& shape, bool includeVertexMaximum = true);
+    const Mesh& mesh, const TopoDS_Shape& shape, bool includeVertexMaximum = true,
+    std::size_t maximumSamples = 0U);
 
 [[nodiscard]] DistanceStatistics brepToMeshDistance(
     const TopoDS_Shape& shape, const Mesh& mesh, double linearDeflection,
     double angularDeflection = 0.08);
 
 [[nodiscard]] BidirectionalDistance compareMeshAndBrep(
-    const Mesh& mesh, const TopoDS_Shape& shape, double linearDeflection);
+    const Mesh& mesh, const TopoDS_Shape& shape, double linearDeflection,
+    std::size_t maximumMeshSamples = 0U);
 
 [[nodiscard]] Aabb brepBounds(const TopoDS_Shape& shape);
 

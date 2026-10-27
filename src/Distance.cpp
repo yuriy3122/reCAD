@@ -224,19 +224,27 @@ double TriangleBvh::distance(const Vec3d& point) const {
 }
 
 DistanceStatistics meshToBrepDistance(
-    const Mesh& mesh, const TopoDS_Shape& shape, bool includeVertexMaximum) {
+    const Mesh& mesh, const TopoDS_Shape& shape, bool includeVertexMaximum,
+    std::size_t maximumSamples) {
     DistanceStatistics result;
     // Query a face-only compound. DistShapeShape reports zero for points in a
     // solid's interior, which is containment distance rather than the required
     // distance to the analytic B-Rep boundary.
     const TopoDS_Compound boundary = surfaceCompound(shape);
-    for (std::size_t i = 0; i < mesh.triangles.size(); ++i) {
+    const std::size_t triangleStride = maximumSamples > 0U
+        ? std::max<std::size_t>(1U, (mesh.triangles.size() + maximumSamples - 1U) / maximumSamples)
+        : 1U;
+    for (std::size_t i = 0; i < mesh.triangles.size(); i += triangleStride) {
         if (mesh.features[i].degenerate || mesh.features[i].area <= 0.0) continue;
         const double distance = exactPointShapeDistance(mesh.features[i].centroid, boundary);
         addSample(result, distance, mesh.features[i].area);
     }
     if (includeVertexMaximum) {
-        for (const Vec3d& vertex : mesh.vertices) {
+        const std::size_t vertexStride = maximumSamples > 0U
+            ? std::max<std::size_t>(1U, (mesh.vertices.size() + maximumSamples - 1U) / maximumSamples)
+            : 1U;
+        for (std::size_t i = 0; i < mesh.vertices.size(); i += vertexStride) {
+            const Vec3d& vertex = mesh.vertices[i];
             result.maximum = std::max(result.maximum, exactPointShapeDistance(vertex, boundary));
         }
     }
@@ -289,9 +297,10 @@ DistanceStatistics brepToMeshDistance(
 }
 
 BidirectionalDistance compareMeshAndBrep(
-    const Mesh& mesh, const TopoDS_Shape& shape, double linearDeflection) {
+    const Mesh& mesh, const TopoDS_Shape& shape, double linearDeflection,
+    std::size_t maximumMeshSamples) {
     BidirectionalDistance result;
-    result.meshToBrep = meshToBrepDistance(mesh, shape, true);
+    result.meshToBrep = meshToBrepDistance(mesh, shape, true, maximumMeshSamples);
     result.brepToMesh = brepToMeshDistance(shape, mesh, linearDeflection);
     result.symmetricRms = std::sqrt(0.5 *
         (result.meshToBrep.rms * result.meshToBrep.rms +
@@ -301,7 +310,7 @@ BidirectionalDistance compareMeshAndBrep(
 
 Aabb brepBounds(const TopoDS_Shape& shape) {
     Bnd_Box bounds;
-    BRepBndLib::Add(shape, bounds, false);
+    BRepBndLib::AddOptimal(shape, bounds, false, false);
     double xmin = 0.0, ymin = 0.0, zmin = 0.0;
     double xmax = 0.0, ymax = 0.0, zmax = 0.0;
     bounds.Get(xmin, ymin, zmin, xmax, ymax, zmax);

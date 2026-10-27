@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Tests"><UniqueIdentifier>{8619798A-0B46-4792-ADBD-0D38DE8E379D}</UniqueIdentifier></Filter>
+    <Filter Include="Implementation"><UniqueIdentifier>{820012EA-323B-49AB-B0CB-73D948DB4865}</UniqueIdentifier></Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="CudaSegmentationTests.cpp"><Filter>Tests</Filter></ClCompile>
+    <ClCompile Include="ReconstructionTests.cpp"><Filter>Tests</Filter></ClCompile>
+    <ClCompile Include="..\src\Geometry.cpp"><Filter>Implementation</Filter></ClCompile>
+    <ClCompile Include="..\src\SurfaceFitting.cpp"><Filter>Implementation</Filter></ClCompile>
+    <ClCompile Include="..\src\PatchReconstruction.cpp"><Filter>Implementation</Filter></ClCompile>
+    <ClCompile Include="..\src\GeneralReconstruction.cpp"><Filter>Implementation</Filter></ClCompile>
+    <ClCompile Include="..\src\ReferenceValidation.cpp"><Filter>Implementation</Filter></ClCompile>
+    <CudaCompile Include="..\src\CudaGeometry.cu"><Filter>Implementation</Filter></CudaCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="run-integration.ps1"><Filter>Tests</Filter></None>
+    <None Include="run-samples.ps1"><Filter>Tests</Filter></None>
+  </ItemGroup>
+</Project>

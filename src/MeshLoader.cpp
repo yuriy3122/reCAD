@@ -442,6 +442,80 @@ void appendPrimitiveTriangles(const std::vector<std::uint32_t>& indices,
     }
 }
 
+struct RawPatchConnectivity {
+    std::vector<std::uint32_t> labels;
+    std::size_t count{};
+};
+
+// Find connected components using only the source index topology.  This must
+// happen before positional welding: duplicate vertices along exported B-Rep
+// face boundaries are useful provenance, even though they occupy identical
+// positions.  Components are edge-connected rather than merely vertex-
+// connected, and labels are assigned by the first triangle in each component
+// so the result is deterministic across runs.
+[[nodiscard]] RawPatchConnectivity labelRawTrianglePatches(
+    const std::vector<Triangle>& triangles) {
+    RawPatchConnectivity result;
+    if (triangles.empty()) return result;
+    if (triangles.size() >
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+        throw MeshLoadError("The source mesh has too many triangles for 32-bit patch labels");
+    }
+
+    std::vector<std::uint32_t> parents(triangles.size());
+    std::vector<unsigned char> ranks(triangles.size(), 0U);
+    std::iota(parents.begin(), parents.end(), 0U);
+
+    const auto findRoot = [&parents](std::uint32_t item) {
+        std::uint32_t root = item;
+        while (parents[root] != root) root = parents[root];
+        while (parents[item] != item) {
+            const std::uint32_t next = parents[item];
+            parents[item] = root;
+            item = next;
+        }
+        return root;
+    };
+    const auto unite = [&parents, &ranks, &findRoot](std::uint32_t lhs, std::uint32_t rhs) {
+        lhs = findRoot(lhs);
+        rhs = findRoot(rhs);
+        if (lhs == rhs) return;
+        if (ranks[lhs] < ranks[rhs]) std::swap(lhs, rhs);
+        parents[rhs] = lhs;
+        if (ranks[lhs] == ranks[rhs]) ++ranks[lhs];
+    };
+
+    std::unordered_map<std::uint64_t, std::uint32_t> firstTriangleByEdge;
+    firstTriangleByEdge.reserve(triangles.size() * 3U);
+    for (std::size_t triangleIndex = 0; triangleIndex < triangles.size(); ++triangleIndex) {
+        const Triangle& triangle = triangles[triangleIndex];
+        for (std::size_t edgeIndex = 0; edgeIndex < 3U; ++edgeIndex) {
+            const std::uint32_t first = triangle.vertices[edgeIndex];
+            const std::uint32_t second = triangle.vertices[(edgeIndex + 1U) % 3U];
+            const std::uint32_t low = std::min(first, second);
+            const std::uint32_t high = std::max(first, second);
+            const std::uint64_t key = (static_cast<std::uint64_t>(low) << 32U) | high;
+            const auto [found, inserted] = firstTriangleByEdge.emplace(
+                key, static_cast<std::uint32_t>(triangleIndex));
+            if (!inserted) {
+                unite(static_cast<std::uint32_t>(triangleIndex), found->second);
+            }
+        }
+    }
+
+    result.labels.resize(triangles.size());
+    std::unordered_map<std::uint32_t, std::uint32_t> labelByRoot;
+    labelByRoot.reserve(triangles.size());
+    for (std::size_t triangleIndex = 0; triangleIndex < triangles.size(); ++triangleIndex) {
+        const std::uint32_t root = findRoot(static_cast<std::uint32_t>(triangleIndex));
+        const auto [found, inserted] = labelByRoot.emplace(
+            root, static_cast<std::uint32_t>(result.count));
+        if (inserted) ++result.count;
+        result.labels[triangleIndex] = found->second;
+    }
+    return result;
+}
+
 struct GridCell {
     std::int64_t x{};
     std::int64_t y{};
@@ -646,8 +720,13 @@ void repairWinding(Mesh& mesh, std::vector<std::string>& warnings) {
 
 [[nodiscard]] Mesh weldAndPrepare(std::vector<Vec3d> rawVertices,
                                   const std::vector<Triangle>& rawTriangles,
+                                  const std::vector<std::uint32_t>& rawPatchLabels,
+                                  std::size_t rawPatchCount,
                                   const MeshLoadOptions& options,
                                   std::vector<std::string>& warnings) {
+    if (rawPatchLabels.size() != rawTriangles.size()) {
+        throw MeshLoadError("Source patch labels do not match the raw triangle array");
+    }
     Mesh mesh;
     mesh.stats.rawVertexCount = rawVertices.size();
     mesh.stats.inputTriangleCount = rawTriangles.size();
@@ -707,9 +786,13 @@ void repairWinding(Mesh& mesh, std::vector<std::string>& warnings) {
     }
 
     mesh.triangles.reserve(rawTriangles.size());
+    mesh.sourcePatchLabels.reserve(rawTriangles.size());
     const double degeneracyThreshold = mesh.bounds.diagonal() * mesh.bounds.diagonal() *
                                        std::numeric_limits<double>::epsilon() * 64.0;
-    for (const Triangle& rawTriangle : rawTriangles) {
+    for (std::size_t rawTriangleIndex = 0;
+         rawTriangleIndex < rawTriangles.size();
+         ++rawTriangleIndex) {
+        const Triangle& rawTriangle = rawTriangles[rawTriangleIndex];
         Triangle triangle{{remap.at(rawTriangle.vertices[0]),
                            remap.at(rawTriangle.vertices[1]),
                            remap.at(rawTriangle.vertices[2])}};
@@ -726,12 +809,31 @@ void repairWinding(Mesh& mesh, std::vector<std::string>& warnings) {
             ++mesh.stats.discardedDegenerateTriangles;
         } else {
             mesh.triangles.push_back(triangle);
+            mesh.sourcePatchLabels.push_back(rawPatchLabels[rawTriangleIndex]);
         }
     }
     if (mesh.triangles.empty()) throw MeshLoadError("No usable triangles remain after welding");
     if (mesh.stats.discardedDegenerateTriangles > 0U) {
         warnings.push_back(std::to_string(mesh.stats.discardedDegenerateTriangles) +
                            " degenerate triangle(s) were discarded after welding");
+    }
+
+    // Degenerate removal may eliminate an entire raw patch.  Compact surviving
+    // labels while retaining deterministic first-triangle ordering.
+    std::vector<std::uint32_t> compactLabels(
+        rawPatchCount, std::numeric_limits<std::uint32_t>::max());
+    std::uint32_t nextLabel = 0;
+    for (std::uint32_t& label : mesh.sourcePatchLabels) {
+        if (label >= rawPatchCount) {
+            throw MeshLoadError("A source patch label is outside its declared range");
+        }
+        std::uint32_t& compact = compactLabels[label];
+        if (compact == std::numeric_limits<std::uint32_t>::max()) compact = nextLabel++;
+        label = compact;
+    }
+    mesh.sourcePatchCount = nextLabel;
+    if (mesh.sourcePatchLabels.size() != mesh.triangles.size()) {
+        throw MeshLoadError("Source patch provenance lost triangle correspondence");
     }
 
     if (options.repairTriangleWinding) repairWinding(mesh, warnings);
@@ -748,7 +850,8 @@ MeshLoadResult loadGlbMesh(const std::filesystem::path& path,
     if (!std::filesystem::exists(path) || !std::filesystem::is_regular_file(path)) {
         throw MeshLoadError("GLB input does not exist or is not a regular file: " + path.string());
     }
-    if (options.weldTolerance < 0.0 ||
+    if (!(options.linearUnitScale > 0.0) || !std::isfinite(options.linearUnitScale) ||
+        options.weldTolerance < 0.0 ||
         options.weldToleranceRelativeToDiagonal < 0.0 ||
         options.weldToleranceRelativeToMedianEdge < 0.0 ||
         !(options.minimumWeldTolerance > 0.0) ||
@@ -827,7 +930,9 @@ MeshLoadResult loadGlbMesh(const std::filesystem::path& path,
                     throw MeshLoadError("Expanded scene exceeds 32-bit vertex indexing");
                 }
                 const std::uint32_t vertexBase = static_cast<std::uint32_t>(rawVertices.size());
-                for (const Vec3d& position : positions) rawVertices.push_back(transformPoint(world, position));
+                for (const Vec3d& position : positions) {
+                    rawVertices.push_back(transformPoint(world, position) * options.linearUnitScale);
+                }
                 const std::size_t triangleCountBefore = rawTriangles.size();
                 appendPrimitiveTriangles(indices, primitive.mode, vertexBase,
                                          options.applySceneTransforms && linearDeterminant(world) < 0.0,
@@ -866,7 +971,13 @@ MeshLoadResult loadGlbMesh(const std::filesystem::path& path,
     if (rawTriangles.empty() || rawVertices.empty()) {
         throw MeshLoadError("The selected glTF scene contains no triangle geometry");
     }
-    result.mesh = weldAndPrepare(std::move(rawVertices), rawTriangles, options, result.warnings);
+    const RawPatchConnectivity rawPatches = labelRawTrianglePatches(rawTriangles);
+    result.mesh = weldAndPrepare(std::move(rawVertices),
+                                 rawTriangles,
+                                 rawPatches.labels,
+                                 rawPatches.count,
+                                 options,
+                                 result.warnings);
     return result;
 }
 

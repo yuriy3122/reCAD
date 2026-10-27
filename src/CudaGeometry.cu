@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@ namespace recad {
 namespace {
 
 constexpr int kThreadsPerBlock = 256;
+constexpr double kPi = 3.141592653589793238462643383279502884;
 
 [[noreturn]] void throwCudaError(cudaError_t error,
                                  const char* expression,
@@ -55,6 +57,12 @@ struct DeviceTriangleFeature {
     double planeOffset;
     double maxEdgeLength;
     int degenerate;
+};
+
+struct DeviceAdjacencyPair {
+    std::uint32_t first;
+    std::uint32_t second;
+    int sourceCompatible{1};
 };
 
 struct DeviceResidualStatistics {
@@ -316,6 +324,61 @@ __global__ void triangleFeatureKernel(const DeviceVec3* vertices,
             feature.planeOffset = -dotProduct(feature.normal, feature.centroid);
         }
         output[index] = feature;
+    }
+}
+
+__global__ void triangleAdjacencyMergeKernel(
+    const DeviceTriangleFeature* features,
+    const DeviceAdjacencyPair* adjacencyPairs,
+    std::size_t pairCount,
+    double minimumNormalDot,
+    double maximumCentroidDistance,
+    double maximumCentroidDistanceToEdgeRatio,
+    bool treatOppositeNormalsAsAligned,
+    std::uint8_t* mergeMask) {
+    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < pairCount;
+         index += stride) {
+        const DeviceAdjacencyPair pair = adjacencyPairs[index];
+        const DeviceTriangleFeature first = features[pair.first];
+        const DeviceTriangleFeature second = features[pair.second];
+        bool merge = pair.sourceCompatible != 0 &&
+                     first.degenerate == 0 && second.degenerate == 0;
+
+        if (merge) {
+            const double firstNormalSquared = dotProduct(first.normal, first.normal);
+            const double secondNormalSquared = dotProduct(second.normal, second.normal);
+            if (!(firstNormalSquared > 0.0) || !(secondNormalSquared > 0.0)) {
+                merge = false;
+            } else {
+                double normalDot = dotProduct(first.normal, second.normal) /
+                    sqrt(firstNormalSquared * secondNormalSquared);
+                normalDot = fmax(-1.0, fmin(1.0, normalDot));
+                if (treatOppositeNormalsAsAligned) normalDot = fabs(normalDot);
+                merge = normalDot >= minimumNormalDot;
+            }
+        }
+
+        if (merge && (maximumCentroidDistance > 0.0 ||
+                      maximumCentroidDistanceToEdgeRatio > 0.0)) {
+            const double centroidDistance = vectorLength(
+                subtract(first.centroid, second.centroid));
+            if (!isfinite(centroidDistance)) {
+                merge = false;
+            }
+            if (merge && maximumCentroidDistance > 0.0 &&
+                centroidDistance > maximumCentroidDistance) {
+                merge = false;
+            }
+            if (merge && maximumCentroidDistanceToEdgeRatio > 0.0) {
+                const double localScale = fmax(first.maxEdgeLength, second.maxEdgeLength);
+                merge = localScale > 0.0 &&
+                    centroidDistance <= maximumCentroidDistanceToEdgeRatio * localScale;
+            }
+        }
+
+        mergeMask[index] = merge ? std::uint8_t{1} : std::uint8_t{0};
     }
 }
 
@@ -683,6 +746,289 @@ CudaTriangleFeatureResult computeTriangleFeaturesCuda(
         destination.degenerate = source.degenerate != 0;
         result.degenerateCount += destination.degenerate ? 1U : 0U;
     }
+    return result;
+}
+
+CudaTriangleSegmentationResult segmentTriangleRegionsCuda(
+    const Mesh& mesh,
+    const CudaTriangleSegmentationOptions& options,
+    int deviceOrdinal) {
+    if (!std::isfinite(options.maximumDihedralAngleRadians) ||
+        options.maximumDihedralAngleRadians < 0.0 ||
+        options.maximumDihedralAngleRadians > kPi) {
+        throw std::invalid_argument(
+            "Maximum dihedral angle must be finite and in the range [0, pi]");
+    }
+    if (options.treatOppositeNormalsAsAligned &&
+        options.maximumDihedralAngleRadians > 0.5 * kPi) {
+        throw std::invalid_argument(
+            "Opposite-normal alignment requires a maximum dihedral angle no greater than pi/2");
+    }
+    if (!std::isfinite(options.maximumCentroidDistance) ||
+        options.maximumCentroidDistance < 0.0) {
+        throw std::invalid_argument(
+            "Maximum centroid distance must be finite and non-negative");
+    }
+    if (!std::isfinite(options.maximumCentroidDistanceToEdgeRatio) ||
+        options.maximumCentroidDistanceToEdgeRatio < 0.0) {
+        throw std::invalid_argument(
+            "Maximum centroid-distance-to-edge ratio must be finite and non-negative");
+    }
+
+    const std::size_t triangleCount = mesh.triangles.size();
+    if (triangleCount > static_cast<std::size_t>(
+                            std::numeric_limits<std::int32_t>::max())) {
+        throw std::length_error("Triangle count exceeds the supported label range");
+    }
+    if (mesh.features.size() != triangleCount) {
+        throw std::invalid_argument(
+            "CUDA triangle segmentation requires one feature record per triangle");
+    }
+    if (mesh.triangleNeighbors.size() != triangleCount) {
+        throw std::invalid_argument(
+            "CUDA triangle segmentation requires one adjacency list per triangle");
+    }
+    const bool hasSourcePatches = options.respectSourcePatchBoundaries &&
+                                  !mesh.sourcePatchLabels.empty();
+    if (hasSourcePatches && mesh.sourcePatchLabels.size() != triangleCount) {
+        throw std::invalid_argument(
+            "Source patch labels must be empty or contain one label per triangle");
+    }
+    if (hasSourcePatches && mesh.sourcePatchCount == 0U) {
+        throw std::invalid_argument(
+            "A mesh with source patch labels must declare a non-zero patch count");
+    }
+    if (hasSourcePatches) {
+        for (const auto label : mesh.sourcePatchLabels) {
+            if (label >= mesh.sourcePatchCount) {
+                throw std::invalid_argument("A source patch label is outside its declared range");
+            }
+        }
+    }
+
+    validatePoints(mesh.vertices);
+    for (std::size_t triangleIndex = 0; triangleIndex < triangleCount; ++triangleIndex) {
+        const Triangle& triangle = mesh.triangles[triangleIndex];
+        for (const std::uint32_t vertex : triangle.vertices) {
+            if (vertex >= mesh.vertices.size()) {
+                std::ostringstream message;
+                message << "Triangle " << triangleIndex
+                        << " contains an out-of-range vertex index";
+                throw std::out_of_range(message.str());
+            }
+        }
+
+        const TriangleFeatures& feature = mesh.features[triangleIndex];
+        if (!finite(feature.centroid) || !std::isfinite(feature.area) ||
+            feature.area < 0.0 || !std::isfinite(feature.maxEdgeLength) ||
+            feature.maxEdgeLength < 0.0) {
+            std::ostringstream message;
+            message << "Triangle feature " << triangleIndex
+                    << " contains an invalid centroid, area, or edge length";
+            throw std::invalid_argument(message.str());
+        }
+        if (!feature.degenerate) {
+            const double normalSquared = feature.normal.x * feature.normal.x +
+                feature.normal.y * feature.normal.y + feature.normal.z * feature.normal.z;
+            if (!finite(feature.normal) || !std::isfinite(normalSquared) ||
+                !(normalSquared > 0.0) || !(feature.area > 0.0) ||
+                !(feature.maxEdgeLength > 0.0)) {
+                std::ostringstream message;
+                message << "Non-degenerate triangle feature " << triangleIndex
+                        << " has invalid geometry";
+                throw std::invalid_argument(message.str());
+            }
+        }
+    }
+
+    std::vector<DeviceAdjacencyPair> adjacencyPairs;
+    for (std::size_t triangleIndex = 0; triangleIndex < triangleCount; ++triangleIndex) {
+        for (const std::uint32_t neighbor : mesh.triangleNeighbors[triangleIndex]) {
+            if (neighbor >= triangleCount) {
+                std::ostringstream message;
+                message << "Triangle " << triangleIndex
+                        << " has an out-of-range adjacent triangle index";
+                throw std::out_of_range(message.str());
+            }
+            if (neighbor == triangleIndex) {
+                std::ostringstream message;
+                message << "Triangle " << triangleIndex << " is adjacent to itself";
+                throw std::invalid_argument(message.str());
+            }
+            const auto& reverseNeighbors = mesh.triangleNeighbors[neighbor];
+            if (std::find(reverseNeighbors.begin(), reverseNeighbors.end(),
+                          static_cast<std::uint32_t>(triangleIndex)) == reverseNeighbors.end()) {
+                std::ostringstream message;
+                message << "Triangle adjacency is not symmetric for pair "
+                        << triangleIndex << " and " << neighbor;
+                throw std::invalid_argument(message.str());
+            }
+            const std::uint32_t first = static_cast<std::uint32_t>(
+                std::min<std::size_t>(triangleIndex, neighbor));
+            const std::uint32_t second = static_cast<std::uint32_t>(
+                std::max<std::size_t>(triangleIndex, neighbor));
+            adjacencyPairs.push_back({first, second});
+        }
+    }
+    std::sort(adjacencyPairs.begin(), adjacencyPairs.end(),
+              [](const DeviceAdjacencyPair& left, const DeviceAdjacencyPair& right) {
+                  return left.first < right.first ||
+                      (left.first == right.first && left.second < right.second);
+              });
+    adjacencyPairs.erase(
+        std::unique(adjacencyPairs.begin(), adjacencyPairs.end(),
+                    [](const DeviceAdjacencyPair& left, const DeviceAdjacencyPair& right) {
+                        return left.first == right.first && left.second == right.second;
+                    }),
+        adjacencyPairs.end());
+
+    for (const DeviceAdjacencyPair pair : adjacencyPairs) {
+        std::size_t sharedVertexCount = 0U;
+        const Triangle& first = mesh.triangles[pair.first];
+        const Triangle& second = mesh.triangles[pair.second];
+        for (std::size_t i = 0; i < first.vertices.size(); ++i) {
+            bool alreadyCounted = false;
+            for (std::size_t previous = 0; previous < i; ++previous) {
+                alreadyCounted = alreadyCounted ||
+                    first.vertices[previous] == first.vertices[i];
+            }
+            if (alreadyCounted) continue;
+            if (std::find(second.vertices.begin(), second.vertices.end(),
+                          first.vertices[i]) != second.vertices.end()) {
+                ++sharedVertexCount;
+            }
+        }
+        if (sharedVertexCount < 2U) {
+            std::ostringstream message;
+            message << "Adjacent triangles " << pair.first << " and " << pair.second
+                    << " do not share a mesh edge";
+            throw std::invalid_argument(message.str());
+        }
+    }
+
+    const SelectedDevice selected = selectDevice(deviceOrdinal);
+    CudaTriangleSegmentationResult result;
+    result.device = selected.info;
+    result.adjacencyPairCount = adjacencyPairs.size();
+    result.triangleLabels.assign(triangleCount, -1);
+
+    if (hasSourcePatches) {
+        for (auto& pair : adjacencyPairs) {
+            pair.sourceCompatible = mesh.sourcePatchLabels[pair.first] ==
+                                    mesh.sourcePatchLabels[pair.second] ? 1 : 0;
+            if (pair.sourceCompatible == 0) ++result.sourceBoundaryPairCount;
+        }
+    }
+
+    std::vector<std::uint8_t> mergeMask(adjacencyPairs.size());
+    if (!adjacencyPairs.empty()) {
+        std::vector<DeviceTriangleFeature> packedFeatures;
+        packedFeatures.reserve(triangleCount);
+        for (const TriangleFeatures& feature : mesh.features) {
+            packedFeatures.push_back({{feature.normal.x, feature.normal.y, feature.normal.z},
+                                      {feature.centroid.x, feature.centroid.y, feature.centroid.z},
+                                      feature.area,
+                                      feature.planeOffset,
+                                      feature.maxEdgeLength,
+                                      feature.degenerate ? 1 : 0});
+        }
+
+        DeviceBuffer<DeviceTriangleFeature> deviceFeatures(triangleCount);
+        DeviceBuffer<DeviceAdjacencyPair> deviceAdjacencyPairs(adjacencyPairs.size());
+        DeviceBuffer<std::uint8_t> deviceMergeMask(adjacencyPairs.size());
+        CudaStream stream;
+        CudaEvent started;
+        CudaEvent uploaded;
+        CudaEvent kernelFinished;
+        CudaEvent downloaded;
+
+        started.record(stream.get());
+        RECAD_CUDA_CHECK(cudaMemcpyAsync(deviceFeatures.get(),
+                                         packedFeatures.data(),
+                                         packedFeatures.size() * sizeof(DeviceTriangleFeature),
+                                         cudaMemcpyHostToDevice,
+                                         stream.get()));
+        RECAD_CUDA_CHECK(cudaMemcpyAsync(deviceAdjacencyPairs.get(),
+                                         adjacencyPairs.data(),
+                                         adjacencyPairs.size() * sizeof(DeviceAdjacencyPair),
+                                         cudaMemcpyHostToDevice,
+                                         stream.get()));
+        uploaded.record(stream.get());
+
+        const int blocks = launchBlockCount(adjacencyPairs.size(), selected.properties);
+        triangleAdjacencyMergeKernel<<<blocks, kThreadsPerBlock, 0, stream.get()>>>(
+            deviceFeatures.get(),
+            deviceAdjacencyPairs.get(),
+            adjacencyPairs.size(),
+            std::cos(options.maximumDihedralAngleRadians),
+            options.maximumCentroidDistance,
+            options.maximumCentroidDistanceToEdgeRatio,
+            options.treatOppositeNormalsAsAligned,
+            deviceMergeMask.get());
+        RECAD_CUDA_CHECK(cudaGetLastError());
+        kernelFinished.record(stream.get());
+
+        RECAD_CUDA_CHECK(cudaMemcpyAsync(mergeMask.data(),
+                                         deviceMergeMask.get(),
+                                         mergeMask.size() * sizeof(std::uint8_t),
+                                         cudaMemcpyDeviceToHost,
+                                         stream.get()));
+        downloaded.record(stream.get());
+        downloaded.synchronize();
+
+        result.timings.hostToDeviceMs = elapsedMilliseconds(started, uploaded);
+        result.timings.kernelMs = elapsedMilliseconds(uploaded, kernelFinished);
+        result.timings.deviceToHostMs = elapsedMilliseconds(kernelFinished, downloaded);
+        result.timings.totalGpuMs = elapsedMilliseconds(started, downloaded);
+    }
+
+    const auto unionFindStarted = std::chrono::steady_clock::now();
+    std::vector<std::uint32_t> parents(triangleCount);
+    for (std::size_t index = 0; index < triangleCount; ++index) {
+        parents[index] = static_cast<std::uint32_t>(index);
+    }
+    const auto findRoot = [&parents](std::uint32_t value) {
+        while (parents[value] != value) {
+            parents[value] = parents[parents[value]];
+            value = parents[value];
+        }
+        return value;
+    };
+    for (std::size_t pairIndex = 0; pairIndex < adjacencyPairs.size(); ++pairIndex) {
+        if (mergeMask[pairIndex] == 0U) continue;
+        ++result.mergedAdjacencyPairCount;
+        const std::uint32_t firstRoot = findRoot(adjacencyPairs[pairIndex].first);
+        const std::uint32_t secondRoot = findRoot(adjacencyPairs[pairIndex].second);
+        if (firstRoot == secondRoot) continue;
+        const std::uint32_t lower = std::min(firstRoot, secondRoot);
+        const std::uint32_t upper = std::max(firstRoot, secondRoot);
+        parents[upper] = lower;
+    }
+
+    std::vector<std::int32_t> rootLabels(triangleCount, -1);
+    for (std::size_t triangleIndex = 0; triangleIndex < triangleCount; ++triangleIndex) {
+        const TriangleFeatures& feature = mesh.features[triangleIndex];
+        if (feature.degenerate) {
+            ++result.degenerateTriangleCount;
+            continue;
+        }
+        const std::uint32_t root = findRoot(static_cast<std::uint32_t>(triangleIndex));
+        std::int32_t& label = rootLabels[root];
+        if (label < 0) {
+            label = static_cast<std::int32_t>(result.regions.size());
+            result.regions.emplace_back();
+        }
+        result.triangleLabels[triangleIndex] = label;
+        CudaTriangleRegion& region = result.regions[static_cast<std::size_t>(label)];
+        region.triangleIndices.push_back(static_cast<std::uint32_t>(triangleIndex));
+        region.area += feature.area;
+        region.centroid += feature.centroid * feature.area;
+    }
+    for (CudaTriangleRegion& region : result.regions) {
+        if (region.area > 0.0) region.centroid /= region.area;
+    }
+    result.hostUnionFindMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - unionFindStarted).count();
     return result;
 }
 

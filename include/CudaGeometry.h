@@ -39,6 +39,46 @@ struct CudaTriangleFeatureResult {
     CudaTimings timings;
 };
 
+// Initial, topology-aware over-segmentation options. Adjacent triangles are
+// connected when their oriented normals satisfy the dihedral threshold and
+// every enabled centroid safeguard passes. A zero centroid limit disables that
+// safeguard. The edge-relative limit is useful when a mesh contains triangles
+// at very different absolute scales.
+struct CudaTriangleSegmentationOptions {
+    // Triangle soups often duplicate all indices, which is not a face prior.
+    bool respectSourcePatchBoundaries{true};
+    double maximumDihedralAngleRadians{0.5235987755982988}; // 30 degrees.
+    double maximumCentroidDistance{};
+    double maximumCentroidDistanceToEdgeRatio{};
+    // Enable only for meshes whose winding could not be made consistent. When
+    // enabled, n and -n are treated as the same orientation and the maximum
+    // meaningful angle is pi/2.
+    bool treatOppositeNormalsAsAligned{};
+};
+
+struct CudaTriangleRegion {
+    std::vector<std::uint32_t> triangleIndices;
+    double area{};
+    Vec3d centroid{}; // Triangle-area-weighted centroid.
+};
+
+struct CudaTriangleSegmentationResult {
+    // Degenerate triangles receive -1. All other labels are contiguous from
+    // zero and deterministic: regions are ordered by their lowest triangle
+    // index and every region's triangle list is ascending.
+    std::vector<std::int32_t> triangleLabels;
+    std::vector<CudaTriangleRegion> regions;
+    std::size_t adjacencyPairCount{};
+    std::size_t mergedAdjacencyPairCount{};
+    // Adjacencies rejected because the GLB's pre-weld index topology placed
+    // the triangles in different source patches.
+    std::size_t sourceBoundaryPairCount{};
+    std::size_t degenerateTriangleCount{};
+    CudaDeviceInfo device;
+    CudaTimings timings;
+    double hostUnionFindMs{};
+};
+
 struct CudaResidualStatistics {
     std::uint64_t sampleCount{};
     std::uint64_t inlierCount{};
@@ -75,6 +115,15 @@ struct CudaResidualResult {
     const std::vector<Vec3d>& vertices,
     const std::vector<Triangle>& triangles,
     double degenerateAreaTolerance = 0.0,
+    int deviceOrdinal = -1);
+
+// Classifies unique adjacent-triangle pairs on the GPU, then performs a
+// deterministic union-find pass on the CPU. mesh.features and
+// mesh.triangleNeighbors must each contain one entry per triangle (normally
+// produced by computeTriangleFeaturesCuda followed by rebuildTopology).
+[[nodiscard]] CudaTriangleSegmentationResult segmentTriangleRegionsCuda(
+    const Mesh& mesh,
+    const CudaTriangleSegmentationOptions& options = {},
     int deviceOrdinal = -1);
 
 // Residual is |n dot p + d| / |n|, so thresholds are expressed in model-space

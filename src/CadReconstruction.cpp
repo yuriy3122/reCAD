@@ -88,7 +88,7 @@ ShapeProperties inspectShape(const TopoDS_Shape& shape) {
     result.faceCount = countSubshapes(shape, TopAbs_FACE);
     result.edgeCount = countSubshapes(shape, TopAbs_EDGE);
     result.vertexCount = countSubshapes(shape, TopAbs_VERTEX);
-    result.closedSolid = result.valid && result.solidCount == 1 && result.shellCount > 0;
+    result.closedSolid = result.valid && result.solidCount > 0 && result.shellCount > 0;
     ShapeMap shells;
     TopExp::MapShapes(shape, TopAbs_SHELL, shells);
     for (int index = 1; index <= shells.Extent(); ++index) {
@@ -101,7 +101,12 @@ ShapeProperties inspectShape(const TopoDS_Shape& shape) {
         const BRepAdaptor_Surface surface(TopoDS::Face(faces(index)), true);
         switch (surface.GetType()) {
         case GeomAbs_Plane: ++result.planarFaceCount; break;
+        case GeomAbs_Cylinder: ++result.cylindricalFaceCount; break;
+        case GeomAbs_Cone: ++result.conicalFaceCount; break;
         case GeomAbs_Sphere: ++result.sphericalFaceCount; break;
+        case GeomAbs_Torus: ++result.toroidalFaceCount; break;
+        case GeomAbs_BSplineSurface:
+        case GeomAbs_BezierSurface: ++result.bsplineFaceCount; break;
         default: ++result.otherSurfaceCount; break;
         }
     }
@@ -112,6 +117,8 @@ ShapeProperties inspectShape(const TopoDS_Shape& shape) {
         switch (curve.GetType()) {
         case GeomAbs_Line: ++result.lineEdgeCount; break;
         case GeomAbs_Circle: ++result.circleEdgeCount; break;
+        case GeomAbs_BSplineCurve:
+        case GeomAbs_BezierCurve: ++result.bsplineEdgeCount; break;
         default: ++result.otherCurveCount; break;
         }
     }

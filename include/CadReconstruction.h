@@ -26,10 +26,15 @@ struct ShapeProperties {
     std::size_t edgeCount{};
     std::size_t vertexCount{};
     std::size_t planarFaceCount{};
+    std::size_t cylindricalFaceCount{};
+    std::size_t conicalFaceCount{};
     std::size_t sphericalFaceCount{};
+    std::size_t toroidalFaceCount{};
+    std::size_t bsplineFaceCount{};
     std::size_t otherSurfaceCount{};
     std::size_t lineEdgeCount{};
     std::size_t circleEdgeCount{};
+    std::size_t bsplineEdgeCount{};
     std::size_t otherCurveCount{};
     double volume{};
     double surfaceArea{};

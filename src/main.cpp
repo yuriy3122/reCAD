@@ -1,7 +1,10 @@
 #include "CadReconstruction.h"
 #include "CudaGeometry.h"
-#include "Geometry.h"
+#include "GeneralReconstruction.h"
 #include "MeshLoader.h"
+#include "PatchReconstruction.h"
+#include "SurfaceFitting.h"
+#include "ReferenceValidation.h"
 
 #include <Standard_Version.hxx>
 #include <cuda_runtime_api.h>
@@ -10,7 +13,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -21,11 +23,11 @@
 #include <limits>
 #include <numeric>
 #include <optional>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -34,116 +36,123 @@ using nlohmann::json;
 namespace recad {
 namespace {
 
+constexpr double kPi = 3.141592653589793238462643383279502884;
+
 struct CommandLine {
     fs::path input{"testData/box_sphere_test-01.glb"};
     fs::path output{"output"};
-    bool verifyExpectedStructure{};
+    // glTF defines linear coordinates in metres. The OCCT STEP writer is
+    // configured for millimetres, so 1000 is the interoperable default.
+    double inputScale{1000.0};
+    double smoothAngleDegrees{30.0};
+    double fitTolerance{};
+    bool forceNurbs{};
+    bool verify{};
+    fs::path referenceStep;
+    bool referenceZUp{};
+    bool verifyAnalytic{};
+    bool ignoreSourcePatches{};
 };
 
-CommandLine parseCommandLine(int argc, char** argv) {
-    CommandLine result;
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view argument(argv[i]);
-        if ((argument == "--input" || argument == "-i") && i + 1 < argc) {
-            result.input = fs::path(argv[++i]);
-        } else if ((argument == "--output" || argument == "-o") && i + 1 < argc) {
-            result.output = fs::path(argv[++i]);
-        } else if (argument == "--verify-expected-structure") {
-            result.verifyExpectedStructure = true;
-        } else if (argument == "--help" || argument == "-h") {
-            std::cout << "mesh2brep --input model.glb --output directory "
-                         "[--verify-expected-structure]\n";
-            std::exit(0);
-        } else {
-            throw std::invalid_argument("Unknown or incomplete argument: " + std::string(argument));
-        }
+double parseNumber(std::string_view text, const char* option) {
+    std::size_t consumed = 0;
+    const std::string value(text);
+    double result = 0.0;
+    try {
+        result = std::stod(value, &consumed);
+    } catch (const std::exception&) {
+        throw std::invalid_argument(std::string(option) + " requires a number");
+    }
+    if (consumed != value.size() || !std::isfinite(result)) {
+        throw std::invalid_argument(std::string(option) + " requires a finite number");
     }
     return result;
 }
 
-std::vector<Vec3d> uniqueSurfacePoints(
-    const Mesh& mesh, const std::vector<std::uint32_t>& triangles,
-    std::vector<double>* weights = nullptr) {
-    std::vector<double> vertexWeights(mesh.vertices.size(), 0.0);
-    for (const std::uint32_t triangleIndex : triangles) {
-        const Triangle& triangle = mesh.triangles.at(triangleIndex);
-        const double contribution = mesh.features.at(triangleIndex).area / 3.0;
-        for (const std::uint32_t vertex : triangle.vertices) vertexWeights[vertex] += contribution;
-    }
-    std::vector<Vec3d> points;
-    points.reserve(mesh.vertices.size());
-    if (weights) weights->clear();
-    for (std::size_t i = 0; i < vertexWeights.size(); ++i) {
-        if (vertexWeights[i] <= 0.0) continue;
-        points.push_back(mesh.vertices[i]);
-        if (weights) weights->push_back(vertexWeights[i]);
-    }
-    return points;
-}
+CommandLine parseCommandLine(int argc, char** argv) {
+    CommandLine result;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        const auto requireValue = [&](const char* option) -> std::string_view {
+            if (index + 1 >= argc) {
+                throw std::invalid_argument(std::string("Missing value for ") + option);
+            }
+            return argv[++index];
+        };
 
-SphereFitResult refineAnalyticConstraints(
-    const SphereFitResult& raw, const OrientedBoxFitResult& box,
-    double scale, std::vector<std::string>& appliedConstraints) {
-    SphereFitResult result = raw;
-    const double tolerance = std::max({scale * 2.0e-5,
-                                       raw.maxResidual * 32.0,
-                                       std::numeric_limits<float>::epsilon() * scale * 16.0});
-    std::vector<double> radiusObservations;
-
-    for (std::size_t axisIndex = 0; axisIndex < 3; ++axisIndex) {
-        const Vec3d& axis = box.axes[axisIndex];
-        const double low = box.lowCoordinates[axisIndex];
-        const double high = box.highCoordinates[axisIndex];
-        const double middle = 0.5 * (low + high);
-        const double halfDimension = 0.5 * (high - low);
-        double coordinate = dot(result.center, axis);
-
-        // An opposite pair of tangent planes jointly constrains both center
-        // coordinate and radius. This is inferred from fit residuals, not from
-        // an expected dimension or axis.
-        if (std::abs(coordinate - middle) <= tolerance &&
-            std::abs(result.radius - halfDimension) <= tolerance) {
-            result.center += axis * (middle - coordinate);
-            coordinate = middle;
-            radiusObservations.push_back(halfDimension);
-            appliedConstraints.push_back(
-                "sphere tangent to opposite box supports on recovered axis " +
-                std::to_string(axisIndex));
+        if (argument == "--input" || argument == "-i") {
+            result.input = fs::path(requireValue("--input"));
+        } else if (argument == "--output" || argument == "-o") {
+            result.output = fs::path(requireValue("--output"));
+        } else if (argument == "--input-scale") {
+            result.inputScale = parseNumber(requireValue("--input-scale"), "--input-scale");
+            if (!(result.inputScale > 0.0)) {
+                throw std::invalid_argument("--input-scale must be positive");
+            }
+        } else if (argument == "--smooth-angle") {
+            result.smoothAngleDegrees = parseNumber(
+                requireValue("--smooth-angle"), "--smooth-angle");
+            if (!(result.smoothAngleDegrees > 0.0 && result.smoothAngleDegrees < 180.0)) {
+                throw std::invalid_argument("--smooth-angle must be between 0 and 180 degrees");
+            }
+        } else if (argument == "--fit-tolerance") {
+            result.fitTolerance = parseNumber(
+                requireValue("--fit-tolerance"), "--fit-tolerance");
+            if (result.fitTolerance < 0.0) {
+                throw std::invalid_argument("--fit-tolerance must be non-negative");
+            }
+        } else if (argument == "--force-nurbs") {
+            result.forceNurbs = true;
+        } else if (argument == "--ignore-source-patches") {
+            result.ignoreSourcePatches = true;
+        } else if (argument == "--reference-step") {
+            result.referenceStep = fs::path(requireValue("--reference-step"));
+        } else if (argument == "--reference-z-up") {
+            result.referenceZUp = true;
+        } else if (argument == "--verify-analytic") {
+            result.verify = true;
+            result.verifyAnalytic = true;
+        } else if (argument == "--verify" || argument == "--verify-expected-structure") {
+            result.verify = true;
+        } else if (argument == "--help" || argument == "-h") {
+            std::cout
+                << "mesh2brep --input model.glb --output directory [options]\n\n"
+                << "Options:\n"
+                << "  --input-scale value    GLB-to-STEP coordinate scale (default 1000)\n"
+                << "  --smooth-angle deg    CUDA adjacency threshold (default 30)\n"
+                << "  --fit-tolerance value Analytic surface tolerance; 0 is automatic\n"
+                << "  --force-nurbs          Skip analytic patch reconstruction\n"
+                << "  --ignore-source-patches Use geometric CUDA segmentation only\n"
+                << "  --reference-step path Compare against STEP after export\n"
+                << "  --reference-z-up      Rotate CAD reference into glTF Y-up frame\n"
+                << "  --verify-analytic     Also require all output faces to be analytic\n"
+                << "  --verify               Fail unless a valid close approximation is built\n";
+            std::exit(0);
+        } else {
+            throw std::invalid_argument("Unknown argument: " + std::string(argument));
         }
-
-        if (std::abs(coordinate - low) <= tolerance) {
-            result.center += axis * (low - coordinate);
-            appliedConstraints.push_back(
-                "sphere center lies on low box support of recovered axis " +
-                std::to_string(axisIndex));
-        } else if (std::abs(coordinate - high) <= tolerance) {
-            result.center += axis * (high - coordinate);
-            appliedConstraints.push_back(
-                "sphere center lies on high box support of recovered axis " +
-                std::to_string(axisIndex));
-        }
-    }
-    if (!radiusObservations.empty()) {
-        result.radius = std::accumulate(radiusObservations.begin(), radiusObservations.end(), 0.0) /
-                        static_cast<double>(radiusObservations.size());
     }
     return result;
 }
 
 double meshSurfaceArea(const Mesh& mesh) {
-    return std::accumulate(mesh.features.begin(), mesh.features.end(), 0.0,
-        [](double sum, const TriangleFeatures& feature) { return sum + feature.area; });
+    return std::accumulate(
+        mesh.features.begin(), mesh.features.end(), 0.0,
+        [](double sum, const TriangleFeatures& feature) {
+            return sum + (feature.degenerate ? 0.0 : feature.area);
+        });
 }
 
 double meshSignedVolume(const Mesh& mesh) {
-    double sixVolume = 0.0;
+    long double sixVolume = 0.0L;
+    const Vec3d reference = mesh.bounds.center();
     for (const Triangle& triangle : mesh.triangles) {
-        const Vec3d& a = mesh.vertices[triangle.vertices[0]];
-        const Vec3d& b = mesh.vertices[triangle.vertices[1]];
-        const Vec3d& c = mesh.vertices[triangle.vertices[2]];
-        sixVolume += dot(a, cross(b, c));
+        const Vec3d a = mesh.vertices[triangle[0]] - reference;
+        const Vec3d b = mesh.vertices[triangle[1]] - reference;
+        const Vec3d c = mesh.vertices[triangle[2]] - reference;
+        sixVolume += static_cast<long double>(dot(a, cross(b, c)));
     }
-    return sixVolume / 6.0;
+    return static_cast<double>(sixVolume / 6.0L);
 }
 
 json vectorJson(const Vec3d& value) {
@@ -151,8 +160,78 @@ json vectorJson(const Vec3d& value) {
 }
 
 json distanceJson(const DistanceStatistics& value) {
-    return {{"rms", value.rms}, {"max", value.maximum}, {"mean", value.mean},
-            {"samples", value.samples}, {"weight", value.weight}};
+    return {{"rms", value.rms},
+            {"max", value.maximum},
+            {"mean", value.mean},
+            {"samples", value.samples},
+            {"weight", value.weight}};
+}
+
+json shapePropertiesJson(const ShapeProperties& value) {
+    return {
+        {"valid", value.valid},
+        {"closed_solid", value.closedSolid},
+        {"solids", value.solidCount},
+        {"shells", value.shellCount},
+        {"faces", value.faceCount},
+        {"edges", value.edgeCount},
+        {"vertices", value.vertexCount},
+        {"planes", value.planarFaceCount},
+        {"cylinders", value.cylindricalFaceCount},
+        {"cones", value.conicalFaceCount},
+        {"spheres", value.sphericalFaceCount},
+        {"tori", value.toroidalFaceCount},
+        {"bspline_surfaces", value.bsplineFaceCount},
+        {"other_surfaces", value.otherSurfaceCount},
+        {"lines", value.lineEdgeCount},
+        {"circles", value.circleEdgeCount},
+        {"bspline_curves", value.bsplineEdgeCount},
+        {"other_curves", value.otherCurveCount},
+        {"volume", value.volume},
+        {"surface_area", value.surfaceArea},
+        {"bounds_min", vectorJson(value.bounds.minimum)},
+        {"bounds_max", vectorJson(value.bounds.maximum)}
+    };
+}
+
+json surfacePatchJson(const SurfacePatchFit& patch) {
+    json result = {
+        {"kind", toString(patch.kind)},
+        {"accepted", patch.accepted},
+        {"triangles", patch.triangleIndices.size()},
+        {"score", patch.score},
+        {"diagnostic", patch.diagnostic},
+        {"area", patch.residuals.area},
+        {"position_rms", patch.residuals.positionRms},
+        {"position_max", patch.residuals.positionMax},
+        {"normal_rms_radians", patch.residuals.normalRmsRadians},
+        {"normal_max_radians", patch.residuals.normalMaxRadians},
+        {"normal_excess_rms_radians", patch.residuals.normalExcessRmsRadians},
+        {"normal_excess_max_radians", patch.residuals.normalExcessMaxRadians},
+        {"inlier_area_fraction", patch.residuals.inlierAreaFraction}
+    };
+    if (const Plane* plane = std::get_if<Plane>(&patch.parameters)) {
+        result["parameters"] = {
+            {"normal", vectorJson(plane->normal)}, {"offset", plane->offset}};
+    } else if (const CylinderSurface* cylinder =
+                   std::get_if<CylinderSurface>(&patch.parameters)) {
+        result["parameters"] = {
+            {"axis_point", vectorJson(cylinder->axisPoint)},
+            {"axis_direction", vectorJson(cylinder->axisDirection)},
+            {"radius", cylinder->radius}};
+    } else if (const SphereSurface* sphere =
+                   std::get_if<SphereSurface>(&patch.parameters)) {
+        result["parameters"] = {
+            {"center", vectorJson(sphere->center)}, {"radius", sphere->radius}};
+    } else if (const TorusSurface* torus =
+                   std::get_if<TorusSurface>(&patch.parameters)) {
+        result["parameters"] = {
+            {"center", vectorJson(torus->center)},
+            {"axis_direction", vectorJson(torus->axisDirection)},
+            {"major_radius", torus->majorRadius},
+            {"minor_radius", torus->minorRadius}};
+    }
+    return result;
 }
 
 std::string compilerVersion() {
@@ -173,17 +252,21 @@ std::string buildConfiguration() {
 
 std::string cudaVersionString(int version) {
     if (version <= 0) return "unknown";
-    const int major = version / 1000;
-    const int minor = (version % 1000) / 10;
-    return std::to_string(major) + "." + std::to_string(minor);
+    return std::to_string(version / 1000) + "." +
+           std::to_string((version % 1000) / 10);
 }
 
-void writeSegmentationPly(
-    const fs::path& path, const Mesh& mesh, const PlaneSegmentationResult& segmentation) {
-    static constexpr std::array<std::array<int, 3>, 12> palette{{
+void writeSegmentationPly(const fs::path& path,
+                          const Mesh& mesh,
+                          const std::vector<std::int32_t>& labels) {
+    if (labels.size() != mesh.triangles.size()) {
+        throw std::invalid_argument("Segmentation label count does not match the mesh");
+    }
+    static constexpr std::array<std::array<int, 3>, 16> palette{{
         {{230, 57, 70}}, {{29, 53, 87}}, {{69, 123, 157}}, {{42, 157, 143}},
         {{233, 196, 106}}, {{244, 162, 97}}, {{231, 111, 81}}, {{142, 202, 230}},
-        {{255, 183, 3}}, {{131, 56, 236}}, {{6, 214, 160}}, {{251, 86, 7}}
+        {{255, 183, 3}}, {{131, 56, 236}}, {{6, 214, 160}}, {{251, 86, 7}},
+        {{0, 150, 199}}, {{144, 190, 109}}, {{181, 101, 167}}, {{255, 127, 14}}
     }};
     std::ofstream stream(path);
     if (!stream) throw std::runtime_error("Cannot write " + path.string());
@@ -197,46 +280,45 @@ void writeSegmentationPly(
     for (const Vec3d& vertex : mesh.vertices) {
         stream << vertex.x << ' ' << vertex.y << ' ' << vertex.z << '\n';
     }
-    for (std::size_t i = 0; i < mesh.triangles.size(); ++i) {
-        const Triangle& triangle = mesh.triangles[i];
-        const std::int32_t label = segmentation.triangleLabels[i];
+    for (std::size_t index = 0; index < mesh.triangles.size(); ++index) {
+        const Triangle& triangle = mesh.triangles[index];
+        const std::int32_t label = labels[index];
         const std::array<int, 3> color = label < 0
             ? std::array<int, 3>{165, 165, 165}
             : palette[static_cast<std::size_t>(label) % palette.size()];
-        stream << "3 " << triangle.vertices[0] << ' ' << triangle.vertices[1] << ' '
-               << triangle.vertices[2] << ' ' << color[0] << ' ' << color[1] << ' '
-               << color[2] << '\n';
+        stream << "3 " << triangle[0] << ' ' << triangle[1] << ' ' << triangle[2]
+               << ' ' << color[0] << ' ' << color[1] << ' ' << color[2] << '\n';
     }
 }
 
-struct SatStatus {
-    bool found{};
-    fs::path path;
-    std::string status;
-    std::string detail;
-};
-
-// Deliberately called only after final candidate selection and BREP/STEP export.
-SatStatus inspectSatCapabilityAfterReconstruction(const fs::path& inputDirectory) {
-    SatStatus result;
-    std::error_code error;
-    for (const fs::directory_entry& entry : fs::directory_iterator(inputDirectory, error)) {
-        if (error) break;
-        std::string extension = entry.path().extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (entry.is_regular_file() && extension == ".sat") {
-            result.found = true;
-            result.path = entry.path();
-            break;
+std::vector<std::int32_t> labelFittedPatches(
+    const Mesh& mesh, std::vector<SurfacePatchFit>& patches) {
+    std::vector<std::int32_t> labels(mesh.triangles.size(), -1);
+    for (std::size_t patchIndex = 0; patchIndex < patches.size(); ++patchIndex) {
+        for (const std::uint32_t triangle : patches[patchIndex].triangleIndices) {
+            if (triangle >= labels.size()) {
+                throw std::runtime_error("Surface fitter returned an out-of-range triangle");
+            }
+            if (labels[triangle] >= 0) {
+                throw std::runtime_error("Surface fitter returned overlapping patches");
+            }
+            labels[triangle] = static_cast<std::int32_t>(patchIndex);
         }
     }
-    result.status = result.found ? "UNSUPPORTED" : "NOT_FOUND";
-    result.detail = result.found
-        ? "OCCT has no native ACIS SAT reader and no licensed SAT translator is installed; "
-          "the SAT contents were not parsed and were not used by reconstruction or selection."
-        : "No SAT reference file was found beside the GLB.";
-    return result;
+
+    // Degenerate input is normally removed by MeshLoader. Preserve any
+    // unexpected uncovered triangle as an explicit NURBS fallback patch.
+    for (std::size_t triangle = 0; triangle < labels.size(); ++triangle) {
+        if (labels[triangle] >= 0) continue;
+        SurfacePatchFit fallback;
+        fallback.kind = SurfaceKind::Unknown;
+        fallback.triangleIndices.push_back(static_cast<std::uint32_t>(triangle));
+        fallback.residuals.area = mesh.features[triangle].area;
+        fallback.diagnostic = "Triangle was not assigned by analytic fitting";
+        labels[triangle] = static_cast<std::int32_t>(patches.size());
+        patches.push_back(std::move(fallback));
+    }
+    return labels;
 }
 
 } // namespace
@@ -245,14 +327,18 @@ SatStatus inspectSatCapabilityAfterReconstruction(const fs::path& inputDirectory
 int main(int argc, char** argv) {
     using namespace recad;
     try {
-        const CommandLine commandLine = parseCommandLine(argc, argv);
-        const fs::path inputPath = fs::absolute(commandLine.input).lexically_normal();
-        const fs::path outputDirectory = fs::absolute(commandLine.output).lexically_normal();
+        const CommandLine command = parseCommandLine(argc, argv);
+        const fs::path inputPath = fs::absolute(command.input).lexically_normal();
+        const fs::path outputDirectory = fs::absolute(command.output).lexically_normal();
         fs::create_directories(outputDirectory);
 
-        std::cout << "mesh2brep: GLB-only analytic reconstruction\n"
-                  << "Input: " << inputPath.string() << "\n";
-        MeshLoadResult loaded = loadGlbMesh(inputPath);
+        std::cout << "mesh2brep: CUDA-segmented analytic/NURBS reconstruction\n"
+                  << "Input: " << inputPath.string() << "\n"
+                  << "Input coordinate scale: " << command.inputScale << "\n";
+
+        MeshLoadOptions loadOptions;
+        loadOptions.linearUnitScale = command.inputScale;
+        MeshLoadResult loaded = loadGlbMesh(inputPath, loadOptions);
         Mesh& mesh = loaded.mesh;
 
         const CudaTriangleFeatureResult gpuFeatures = computeTriangleFeaturesCuda(
@@ -260,304 +346,334 @@ int main(int argc, char** argv) {
         mesh.features = gpuFeatures.features;
         rebuildTopology(mesh);
 
-        PlaneSegmentationOptions planeOptions;
-        planeOptions.distanceTolerance = std::max(mesh.bounds.diagonal() * 1.0e-6,
-                                                   mesh.weldTolerance * 8.0);
-        planeOptions.angleToleranceRadians = 0.01308996938995747; // 0.75 degrees.
-        planeOptions.minimumSupportAreaFraction = 5.0e-4;
-        const PlaneSegmentationResult planes = segmentPlanarRegions(mesh, planeOptions);
-        if (planes.segments.empty()) throw std::runtime_error("No significant planes were detected");
-        if (planes.nonPlanarTriangles.empty()) {
-            throw std::runtime_error("No curved region remains after plane segmentation");
+        CudaTriangleSegmentationOptions segmentationOptions;
+        // When pre-weld GLB connectivity is present it is a stronger face
+        // boundary signal than a tessellation-dependent dihedral threshold.
+        // Pi keeps every source face connected while the CUDA stage still
+        // classifies all adjacency and enforces source boundaries.
+        const bool usefulSourcePatches = !command.ignoreSourcePatches &&
+            mesh.sourcePatchCount > 1U &&
+            mesh.sourcePatchCount <= mesh.triangles.size() / 2U;
+        const double effectiveSmoothAngleDegrees = usefulSourcePatches
+            ? 180.0
+            : command.smoothAngleDegrees;
+        segmentationOptions.maximumDihedralAngleRadians =
+            effectiveSmoothAngleDegrees * kPi / 180.0;
+        segmentationOptions.respectSourcePatchBoundaries = usefulSourcePatches;
+        const CudaTriangleSegmentationResult segmentation =
+            segmentTriangleRegionsCuda(mesh, segmentationOptions, gpuFeatures.device.ordinal);
+        std::cout << "Initial segmentation: " << mesh.sourcePatchCount
+                  << " source components, " << segmentation.regions.size()
+                  << " CUDA regions\n" << std::flush;
+
+        SurfaceFitOptions fitOptions;
+        fitOptions.positionTolerance = command.fitTolerance;
+        fitOptions.minimumPatchAreaFraction = 1.0e-8;
+        fitOptions.splitMixedRegions = true;
+        const auto fitStarted = std::chrono::steady_clock::now();
+        std::vector<SurfacePatchFit> patches = fitSurfacePatches(
+            mesh, segmentation.triangleLabels, fitOptions);
+        const double fitMilliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - fitStarted).count();
+        const std::vector<std::int32_t> fittedLabels = labelFittedPatches(mesh, patches);
+
+        double analyticArea = 0.0;
+        std::size_t acceptedAnalyticPatches = 0;
+        for (const SurfacePatchFit& patch : patches) {
+            if (patch.accepted && patch.kind != SurfaceKind::Unknown &&
+                patch.kind != SurfaceKind::BSpline) {
+                analyticArea += patch.residuals.area;
+                ++acceptedAnalyticPatches;
+            }
+        }
+        const double totalArea = meshSurfaceArea(mesh);
+        const double analyticCoverage = totalArea > 0.0 ? analyticArea / totalArea : 0.0;
+
+        const double modelScale = std::max(
+            mesh.bounds.diagonal(), std::numeric_limits<double>::min());
+        const double sewingTolerance = std::max({
+            mesh.weldTolerance * 8.0,
+            modelScale * 2.0e-7,
+            std::numeric_limits<double>::epsilon() * modelScale * 256.0});
+        const double comparisonDeflection = modelScale * 2.0e-4;
+
+        TopoDS_Shape selectedShape;
+        std::string reconstructionMethod;
+        std::vector<std::string> reconstructionDiagnostics;
+        PatchReconstructionResult patchReconstruction;
+        GeneralReconstructionResult nurbsFallback;
+        BidirectionalDistance distances;
+
+        if (!command.forceNurbs) {
+            const auto reconstructionStarted = std::chrono::steady_clock::now();
+            PatchReconstructionOptions reconstructionOptions;
+            // Let the patch builder include the tessellation chord sag when
+            // sewing analytic curves to neighboring fitted surfaces.
+            reconstructionOptions.sewingTolerance = 0.0;
+            patchReconstruction = buildPatchReconstruction(mesh, patches, reconstructionOptions);
+            const double reconstructionMilliseconds =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - reconstructionStarted).count();
+            std::ostringstream timing;
+            timing << "Hybrid patch reconstruction took " << reconstructionMilliseconds << " ms";
+            reconstructionDiagnostics.push_back(timing.str());
+            reconstructionDiagnostics.insert(reconstructionDiagnostics.end(),
+                                             patchReconstruction.diagnostics.begin(),
+                                             patchReconstruction.diagnostics.end());
+
+            if (patchReconstruction.succeeded) {
+                try {
+                    distances = compareMeshAndBrep(
+                        mesh, patchReconstruction.shape, comparisonDeflection);
+                    const double maximum = std::max(
+                        distances.meshToBrep.maximum, distances.brepToMesh.maximum);
+                    const bool closeEnough =
+                        distances.symmetricRms <= modelScale * 2.0e-3 &&
+                        maximum <= modelScale * 1.0e-2;
+                    if (closeEnough) {
+                        selectedShape = patchReconstruction.shape;
+                        reconstructionMethod = patchReconstruction.fallbackTriangleCount == 0U &&
+                                               patchReconstruction.fittedNurbsFaceCount == 0U
+                            ? "analytic_patches"
+                            : "hybrid_analytic_nurbs";
+                    } else {
+                        std::ostringstream message;
+                        message << "Hybrid B-Rep rejected by mesh distance: RMS="
+                                << distances.symmetricRms << ", max=" << maximum;
+                        reconstructionDiagnostics.push_back(message.str());
+                    }
+                } catch (const std::exception& error) {
+                    reconstructionDiagnostics.push_back(
+                        std::string("Hybrid B-Rep comparison failed: ") + error.what());
+                }
+            }
         }
 
-        const SphereFitResult rawSphere = fitSphere(mesh, planes.nonPlanarTriangles);
-        if (!rawSphere.valid) throw std::runtime_error("Sphere fit failed: " + rawSphere.diagnostic);
-        const OrientedBoxFitResult box = inferOrientedBox(mesh, planes.segments);
-        if (!box.valid) throw std::runtime_error("Oriented box inference failed: " + box.diagnostic);
-
-        std::vector<std::string> constraints;
-        SphereFitResult sphere = refineAnalyticConstraints(
-            rawSphere, box, mesh.bounds.diagonal(), constraints);
-        std::vector<double> curvedWeights;
-        const std::vector<Vec3d> curvedPoints = uniqueSurfacePoints(
-            mesh, planes.nonPlanarTriangles, &curvedWeights);
-        const double sphereTolerance = std::max(mesh.bounds.diagonal() * 1.0e-5,
-                                                 rawSphere.maxResidual * 8.0);
-        const CudaResidualResult sphereGpu = evaluateSphereResidualsCuda(
-            curvedPoints, sphere.center, sphere.radius, sphereTolerance, curvedWeights,
-            gpuFeatures.device.ordinal);
-        sphere.rmsResidual = sphereGpu.statistics.weightedRmsResidual;
-        sphere.maxResidual = sphereGpu.statistics.maxResidual;
-        sphere.inlierFraction = sphereGpu.statistics.inlierWeightFraction;
-        sphere.pointCount = curvedPoints.size();
-
-        std::vector<CudaResidualStatistics> planeGpuStatistics;
-        planeGpuStatistics.reserve(planes.segments.size());
-        for (const PlaneSegment& segment : planes.segments) {
-            std::vector<double> weights;
-            const std::vector<Vec3d> points = uniqueSurfacePoints(mesh, segment.triangleIndices, &weights);
-            planeGpuStatistics.push_back(evaluatePlaneResidualsCuda(
-                points, segment.plane.normal, segment.plane.offset,
-                planes.distanceTolerance, weights, gpuFeatures.device.ordinal).statistics);
+        if (selectedShape.IsNull()) {
+            nurbsFallback = buildNurbsFallback(mesh, sewingTolerance);
+            reconstructionDiagnostics.insert(reconstructionDiagnostics.end(),
+                                             nurbsFallback.diagnostics.begin(),
+                                             nurbsFallback.diagnostics.end());
+            if (!nurbsFallback.succeeded) {
+                throw std::runtime_error(
+                    "Both analytic patch reconstruction and NURBS fallback failed");
+            }
+            selectedShape = nurbsFallback.shape;
+            reconstructionMethod = "nurbs_mesh_fallback";
+            distances = compareMeshAndBrep(mesh, selectedShape,
+                                           comparisonDeflection, 256U);
         }
 
-        const double modelingTolerance = std::max(mesh.bounds.diagonal() * 1.0e-8,
-                                                   mesh.weldTolerance * 4.0);
-        const double comparisonDeflection = mesh.bounds.diagonal() * 2.0e-4;
-        std::cout << "Building and scoring CUT, FUSE, and COMMON...\n";
-        CadReconstructionResult cad = buildAndSelectBoolean(
-            box, sphere, mesh, modelingTolerance, comparisonDeflection);
-        const BooleanCandidate& selected = cad.candidates[cad.selectedCandidate];
-        if (!selected.properties.valid || !selected.properties.closedSolid ||
-            selected.properties.solidCount != 1 ||
-            selected.properties.planarFaceCount == 0 ||
-            selected.properties.sphericalFaceCount == 0 ||
-            selected.properties.otherSurfaceCount != 0 ||
-            selected.properties.circleEdgeCount == 0) {
-            throw std::runtime_error(
-                "Selected Boolean did not produce a closed, valid analytic plane/sphere solid");
+        const ShapeProperties properties = inspectShape(selectedShape);
+        if (!properties.valid || !properties.closedSolid || properties.solidCount == 0U) {
+            throw std::runtime_error("Selected reconstruction is not a valid closed solid");
         }
 
         const fs::path brepPath = outputDirectory / "reconstructed.brep";
         const fs::path stepPath = outputDirectory / "reconstructed.step";
-        writeBrepAndStep(cad.selectedShape, brepPath, stepPath);
-        writeSegmentationPly(outputDirectory / "segmentation.ply", mesh, planes);
+        writeBrepAndStep(selectedShape, brepPath, stepPath);
+        writeSegmentationPly(outputDirectory / "segmentation.ply", mesh, fittedLabels);
 
-        // The reconstruction is now fixed and exported. Only at this point do
-        // we look for the SAT reference, and then only to report translator
-        // capability; no SAT geometry is fed back into the pipeline.
-        const SatStatus sat = inspectSatCapabilityAfterReconstruction(inputPath.parent_path());
+        // Geometry is finalized and exported before a reference is opened.
+        std::optional<ReferenceValidationResult> referenceValidation;
+        if (!command.referenceStep.empty()) {
+            ReferenceValidationOptions referenceOptions;
+            referenceOptions.referenceZUpToGltf = command.referenceZUp;
+            referenceValidation = validateAgainstStepReference(
+                selectedShape, command.referenceStep, referenceOptions);
+        }
 
         json root;
-        root["schema_version"] = 1;
-        root["input"] = inputPath.string();
+        root["schema_version"] = 2;
+        root["input"] = {
+            {"path", inputPath.string()},
+            {"coordinate_scale_to_millimetres", command.inputScale},
+            {"warnings", loaded.warnings}
+        };
         root["environment"] = {
             {"build_configuration", buildConfiguration()},
             {"msvc_full_version", compilerVersion()},
-            {"cmake_version", RECAD_CMAKE_VERSION},
+            {"build_system", "Visual Studio 2026 / MSBuild"},
+            {"cuda_compile_version", cudaVersionString(CUDART_VERSION)},
             {"cuda_runtime_version", cudaVersionString(gpuFeatures.device.runtimeVersion)},
             {"cuda_driver_version", cudaVersionString(gpuFeatures.device.driverVersion)},
-            {"cuda_compile_version", cudaVersionString(CUDART_VERSION)},
             {"gpu", gpuFeatures.device.name},
-            {"compute_capability", std::to_string(gpuFeatures.device.computeCapabilityMajor) + "." +
-                                   std::to_string(gpuFeatures.device.computeCapabilityMinor)},
+            {"compute_capability", std::to_string(gpuFeatures.device.computeCapabilityMajor) +
+                                   "." + std::to_string(gpuFeatures.device.computeCapabilityMinor)},
             {"occt_version", OCC_VERSION_COMPLETE}
         };
         root["mesh"] = {
             {"raw_vertices", mesh.stats.rawVertexCount},
             {"welded_vertices", mesh.stats.weldedVertexCount},
+            {"input_triangles", mesh.stats.inputTriangleCount},
             {"triangles", mesh.stats.triangleCount},
-            {"bounds_min", vectorJson(mesh.bounds.minimum)},
-            {"bounds_max", vectorJson(mesh.bounds.maximum)},
-            {"diagonal", mesh.bounds.diagonal()},
-            {"weld_tolerance", mesh.weldTolerance},
+            {"source_patches", mesh.sourcePatchCount},
+            {"bounds_min_mm", vectorJson(mesh.bounds.minimum)},
+            {"bounds_max_mm", vectorJson(mesh.bounds.maximum)},
+            {"diagonal_mm", modelScale},
+            {"weld_tolerance_mm", mesh.weldTolerance},
             {"components", mesh.stats.connectedComponentCount},
             {"boundary_edges", mesh.stats.boundaryEdgeCount},
             {"non_manifold_edges", mesh.stats.nonManifoldEdgeCount},
-            {"degenerate_triangles", mesh.stats.discardedDegenerateTriangles + gpuFeatures.degenerateCount},
             {"watertight", mesh.stats.watertight},
-            {"surface_area", meshSurfaceArea(mesh)},
-            {"signed_volume", meshSignedVolume(mesh)}
+            {"surface_area_mm2", totalArea},
+            {"signed_volume_mm3", meshSignedVolume(mesh)}
         };
-        root["cuda_timing_ms"] = {
-            {"features_h2d", gpuFeatures.timings.hostToDeviceMs},
-            {"features_kernel", gpuFeatures.timings.kernelMs},
-            {"features_d2h", gpuFeatures.timings.deviceToHostMs},
-            {"features_total_gpu", gpuFeatures.timings.totalGpuMs},
-            {"sphere_kernel", sphereGpu.timings.kernelMs}
+        root["cuda_segmentation"] = {
+            {"requested_smooth_angle_degrees", command.smoothAngleDegrees},
+            {"effective_smooth_angle_degrees", effectiveSmoothAngleDegrees},
+            {"regions", segmentation.regions.size()},
+            {"adjacency_pairs", segmentation.adjacencyPairCount},
+            {"merged_pairs", segmentation.mergedAdjacencyPairCount},
+            {"source_boundary_pairs", segmentation.sourceBoundaryPairCount},
+            {"source_prior_used", usefulSourcePatches},
+            {"feature_kernel_ms", gpuFeatures.timings.kernelMs},
+            {"segmentation_kernel_ms", segmentation.timings.kernelMs},
+            {"segmentation_total_gpu_ms", segmentation.timings.totalGpuMs},
+            {"host_union_find_ms", segmentation.hostUnionFindMs}
         };
-        root["planes"] = json::array();
-        for (std::size_t i = 0; i < planes.segments.size(); ++i) {
-            const PlaneSegment& segment = planes.segments[i];
-            root["planes"].push_back({
-                {"normal", vectorJson(segment.plane.normal)},
-                {"d", segment.plane.offset},
-                {"triangles", segment.triangleIndices.size()},
-                {"connected_components", segment.connectedComponents},
-                {"area", segment.area},
-                {"rms", segment.rmsResidual},
-                {"max", segment.maxResidual},
-                {"cuda_weighted_rms", planeGpuStatistics[i].weightedRmsResidual},
-                {"cuda_inliers", planeGpuStatistics[i].inlierCount}
-            });
+        root["surface_fitting"] = {
+            {"patch_count", patches.size()},
+            {"accepted_analytic_patches", acceptedAnalyticPatches},
+            {"analytic_area_fraction", analyticCoverage},
+            {"fit_ms", fitMilliseconds},
+            {"patches", json::array()}
+        };
+        for (const SurfacePatchFit& patch : patches) {
+            root["surface_fitting"]["patches"].push_back(surfacePatchJson(patch));
         }
-        root["sphere"] = {
-            {"raw_center", vectorJson(rawSphere.center)},
-            {"raw_radius", rawSphere.radius},
-            {"center", vectorJson(sphere.center)},
-            {"radius", sphere.radius},
-            {"points", sphere.pointCount},
-            {"inliers", sphereGpu.statistics.inlierCount},
-            {"rms", sphere.rmsResidual},
-            {"max", sphere.maxResidual},
-            {"inlier_fraction", sphere.inlierFraction},
-            {"radial_orientation", sphere.radialOrientation},
-            {"inferred_constraints", constraints}
+        root["reconstruction"] = {
+            {"method", reconstructionMethod},
+            {"properties", shapePropertiesJson(properties)},
+            {"mesh_to_brep", distanceJson(distances.meshToBrep)},
+            {"brep_to_mesh", distanceJson(distances.brepToMesh)},
+            {"symmetric_rms", distances.symmetricRms},
+            {"diagnostics", reconstructionDiagnostics},
+            {"hybrid", {
+                {"succeeded", patchReconstruction.succeeded},
+                {"analytic_faces", patchReconstruction.analyticFaceCount},
+                {"fitted_nurbs_faces", patchReconstruction.fittedNurbsFaceCount},
+                {"fallback_faces", patchReconstruction.fallbackFaceCount},
+                {"fallback_triangles", patchReconstruction.fallbackTriangleCount},
+                {"analytic_patch_failures", patchReconstruction.analyticPatchFailureCount}
+            }},
+            {"full_nurbs_fallback", {
+                {"succeeded", nurbsFallback.succeeded},
+                {"faces", nurbsFallback.createdFaceCount},
+                {"skipped_triangles", nurbsFallback.skippedTriangleCount}
+            }},
+            {"brep_path", brepPath.string()},
+            {"step_path", stepPath.string()}
         };
-        root["box"] = {
-            {"center", vectorJson(box.center)},
-            {"dimensions", vectorJson(box.dimensions)},
-            {"axes", json::array({vectorJson(box.axes[0]), vectorJson(box.axes[1]), vectorJson(box.axes[2])})},
-            {"low_coordinates", vectorJson(box.lowCoordinates)},
-            {"high_coordinates", vectorJson(box.highCoordinates)},
-            {"rms", box.rmsResidual},
-            {"max", box.maxResidual},
-            {"orthogonality_error", box.orthogonalityError}
-        };
-        root["box"]["supporting_planes"] = json::array();
-        for (std::size_t i = 0; i < 3; ++i) {
-            root["box"]["supporting_planes"].push_back({
-                {"normal", vectorJson(-box.axes[i])}, {"d", box.lowCoordinates[i]}});
-            root["box"]["supporting_planes"].push_back({
-                {"normal", vectorJson(box.axes[i])}, {"d", -box.highCoordinates[i]}});
+        if (referenceValidation) {
+            const auto& reference = *referenceValidation;
+            root["reference_validation"] = {
+                {"path", reference.referencePath.string()},
+                {"reference_z_up_to_gltf", command.referenceZUp},
+                {"reference_loaded", reference.referenceLoaded},
+                {"properties_compared", reference.propertiesCompared},
+                {"distances_compared", reference.distancesCompared},
+                {"reference_valid", reference.reference.valid},
+                {"reference_closed", reference.reference.closed},
+                {"reference_faces", reference.reference.faceCount},
+                {"reference_planes", reference.reference.surfaces.planes},
+                {"reference_cylinders", reference.reference.surfaces.cylinders},
+                {"reference_spheres", reference.reference.surfaces.spheres},
+                {"reference_tori", reference.reference.surfaces.tori},
+                {"topology_counts_match", reference.topology.exactMatch},
+                {"volume_relative_error", reference.properties.volumeRelativeError},
+                {"area_relative_error", reference.properties.surfaceAreaRelativeError},
+                {"bounds_max_coordinate_error_mm",
+                    reference.properties.boundsMaximumCoordinateError},
+                {"symmetric_rms_mm", reference.distances.symmetricRms},
+                {"symmetric_max_mm", reference.distances.symmetricMaximum},
+                {"normalized_rms", reference.distances.normalizedSymmetricRms},
+                {"normalized_max", reference.distances.normalizedSymmetricMaximum},
+                {"reconstructed_to_reference_samples",
+                    reference.distances.reconstructedToReference.sampleCount},
+                {"reference_to_reconstructed_samples",
+                    reference.distances.referenceToReconstructed.sampleCount},
+                {"failed_samples", reference.distances.reconstructedToReference.failedSampleCount +
+                                    reference.distances.referenceToReconstructed.failedSampleCount},
+                {"diagnostics", reference.diagnostics}
+            };
         }
-        root["box"]["corners"] = json::array();
-        for (unsigned mask = 0; mask < 8; ++mask) {
-            Vec3d corner{};
-            for (std::size_t i = 0; i < 3; ++i) {
-                const double coordinate = (mask & (1u << i)) != 0
-                    ? box.highCoordinates[i] : box.lowCoordinates[i];
-                corner += box.axes[i] * coordinate;
-            }
-            root["box"]["corners"].push_back(vectorJson(corner));
+
+        {
+            std::ofstream stream(outputDirectory / "reconstruction.json");
+            if (!stream) throw std::runtime_error("Cannot write reconstruction.json");
+            stream << std::setw(2) << root << '\n';
         }
-        root["boolean_candidates"] = json::array();
-        for (const BooleanCandidate& candidate : cad.candidates) {
-            root["boolean_candidates"].push_back({
-                {"operation", toString(candidate.operation)},
-                {"build_succeeded", candidate.buildSucceeded},
-                {"valid", candidate.properties.valid},
-                {"solid_count", candidate.properties.solidCount},
-                {"score", candidate.score},
-                {"bbox_error", candidate.boundingBoxError},
-                {"mesh_to_brep", distanceJson(candidate.distances.meshToBrep)},
-                {"brep_to_mesh", distanceJson(candidate.distances.brepToMesh)},
-                {"diagnostic", candidate.diagnostic}
-            });
-        }
-        root["selected_boolean"] = toString(selected.operation);
-        root["brep"] = {
-            {"valid", selected.properties.valid},
-            {"closed_solid", selected.properties.closedSolid},
-            {"solid_count", selected.properties.solidCount},
-            {"face_count", selected.properties.faceCount},
-            {"edge_count", selected.properties.edgeCount},
-            {"vertex_count", selected.properties.vertexCount},
-            {"planar_faces", selected.properties.planarFaceCount},
-            {"spherical_faces", selected.properties.sphericalFaceCount},
-            {"other_surfaces", selected.properties.otherSurfaceCount},
-            {"circle_edges", selected.properties.circleEdgeCount},
-            {"volume", selected.properties.volume},
-            {"surface_area", selected.properties.surfaceArea},
-            {"mesh_to_brep", distanceJson(selected.distances.meshToBrep)},
-            {"brep_to_mesh", distanceJson(selected.distances.brepToMesh)}
-        };
-        root["sat_verification"] = {
-            {"found", sat.found}, {"path", sat.path.string()},
-            {"status", sat.status}, {"detail", sat.detail}
-        };
 
         std::ostringstream report;
-        report << std::setprecision(12) << std::fixed;
-        report << "Build status: SUCCESS (" << buildConfiguration() << ")\n"
-               << "MSVC version: " << compilerVersion() << "\n"
-               << "CMake version: " << RECAD_CMAKE_VERSION << "\n"
-               << "CUDA version: compile " << cudaVersionString(CUDART_VERSION)
-               << ", runtime " << cudaVersionString(gpuFeatures.device.runtimeVersion) << "\n"
-               << "GPU used: " << gpuFeatures.device.name << " (sm_"
-               << gpuFeatures.device.computeCapabilityMajor << gpuFeatures.device.computeCapabilityMinor << ")\n"
-               << "OpenCascade version: " << OCC_VERSION_COMPLETE << "\n\n"
-               << "GLB raw vertices/triangles: " << mesh.stats.rawVertexCount << " / "
+        report << std::setprecision(12) << std::fixed
+               << "Build status: SUCCESS (" << buildConfiguration() << ")\n"
+               << "Input: " << inputPath.string() << "\n"
+               << "GLB-to-mm scale: " << command.inputScale << "\n"
+               << "GPU: " << gpuFeatures.device.name << " (sm_"
+               << gpuFeatures.device.computeCapabilityMajor
+               << gpuFeatures.device.computeCapabilityMinor << ")\n"
+               << "OpenCascade: " << OCC_VERSION_COMPLETE << "\n\n"
+               << "Mesh vertices/triangles: " << mesh.stats.weldedVertexCount << "/"
                << mesh.stats.triangleCount << "\n"
-               << "Welded vertices: " << mesh.stats.weldedVertexCount << "\n"
-               << "Bounds: [" << mesh.bounds.minimum.x << ", " << mesh.bounds.minimum.y << ", "
-               << mesh.bounds.minimum.z << "] - [" << mesh.bounds.maximum.x << ", "
-               << mesh.bounds.maximum.y << ", " << mesh.bounds.maximum.z << "]\n"
-               << "Topology: components=" << mesh.stats.connectedComponentCount
-               << ", boundary edges=" << mesh.stats.boundaryEdgeCount
-               << ", non-manifold edges=" << mesh.stats.nonManifoldEdgeCount
-               << ", degenerate triangles="
-               << (mesh.stats.discardedDegenerateTriangles + gpuFeatures.degenerateCount)
-               << ", watertight=" << (mesh.stats.watertight ? "YES" : "NO") << "\n"
-               << "CUDA feature timing: H2D=" << gpuFeatures.timings.hostToDeviceMs
-               << " ms, kernel=" << gpuFeatures.timings.kernelMs
-               << " ms, D2H=" << gpuFeatures.timings.deviceToHostMs << " ms\n\n"
-               << "Detected planes: " << planes.segments.size() << "\n";
-        for (std::size_t i = 0; i < planes.segments.size(); ++i) {
-            const PlaneSegment& plane = planes.segments[i];
-            report << "  [" << i << "] n=(" << plane.plane.normal.x << ", "
-                   << plane.plane.normal.y << ", " << plane.plane.normal.z << "), d="
-                   << plane.plane.offset << ", triangles=" << plane.triangleIndices.size()
-                   << ", components=" << plane.connectedComponents << ", RMS="
-                   << plane.rmsResidual << ", max=" << plane.maxResidual << "\n";
-        }
-        report << "\nRecovered box center: (" << box.center.x << ", " << box.center.y << ", "
-               << box.center.z << ")\n"
-               << "Recovered box dimensions: (" << box.dimensions.x << ", "
-               << box.dimensions.y << ", " << box.dimensions.z << ")\n";
-        for (std::size_t i = 0; i < 3; ++i) {
-            report << "  axis " << i << ": (" << box.axes[i].x << ", " << box.axes[i].y
-                   << ", " << box.axes[i].z << ")\n";
-        }
-        report << "Recovered sphere center/radius: (" << sphere.center.x << ", "
-               << sphere.center.y << ", " << sphere.center.z << ") / " << sphere.radius << "\n"
-               << "Sphere fitting error RMS/max: " << sphere.rmsResidual << " / "
-               << sphere.maxResidual << " (" << sphereGpu.statistics.inlierCount << "/"
-               << sphere.pointCount << " inliers, weighted fraction="
-               << sphere.inlierFraction << ")\n\n"
-               << "Boolean candidate scores (lower is better):\n";
-        for (const BooleanCandidate& candidate : cad.candidates) {
-            report << "  " << toString(candidate.operation) << ": score=" << candidate.score
-                   << ", GLB->BRep RMS/max=" << candidate.distances.meshToBrep.rms << "/"
-                   << candidate.distances.meshToBrep.maximum << ", BRep->GLB RMS/max="
-                   << candidate.distances.brepToMesh.rms << "/"
-                   << candidate.distances.brepToMesh.maximum << ", valid="
-                   << (candidate.properties.valid ? "YES" : "NO") << "\n";
-        }
-        report << "Selected Boolean: " << toString(selected.operation) << "\n\n"
-               << "B-Rep valid: " << (selected.properties.valid ? "YES" : "NO") << "\n"
-               << "Closed solid: " << (selected.properties.closedSolid ? "YES" : "NO") << "\n"
-               << "Solid/face/edge/vertex counts: " << selected.properties.solidCount << "/"
-               << selected.properties.faceCount << "/" << selected.properties.edgeCount << "/"
-               << selected.properties.vertexCount << "\n"
-               << "Analytic planar/spherical/other faces: " << selected.properties.planarFaceCount
-               << "/" << selected.properties.sphericalFaceCount << "/"
-               << selected.properties.otherSurfaceCount << "\n"
-               << "Line/circle/other edges: " << selected.properties.lineEdgeCount << "/"
-               << selected.properties.circleEdgeCount << "/" << selected.properties.otherCurveCount << "\n"
-               << "Volume: " << selected.properties.volume << "\n"
-               << "Surface area: " << selected.properties.surfaceArea << "\n"
-               << "GLB -> BRep RMS/max: " << selected.distances.meshToBrep.rms << " / "
-               << selected.distances.meshToBrep.maximum << "\n"
-               << "BRep -> GLB RMS/max: " << selected.distances.brepToMesh.rms << " / "
-               << selected.distances.brepToMesh.maximum << "\n\n"
-               << "SAT verification status: " << sat.status << "\n"
-               << sat.detail << "\n"
-               << "Known limitations: unsigned distance scoring; STEP numeric coordinates are written as mm "
-                  "because GLB contains no authoritative unit metadata; SAT verification requires an external "
-                  "licensed ACIS translator.\n";
-
-        {
-            std::ofstream jsonStream(outputDirectory / "reconstruction.json");
-            if (!jsonStream) throw std::runtime_error("Cannot write reconstruction.json");
-            jsonStream << std::setw(2) << root << '\n';
+               << "Watertight: " << (mesh.stats.watertight ? "YES" : "NO") << "\n"
+               << "Source patches: " << mesh.sourcePatchCount << "\n"
+               << "CUDA regions: " << segmentation.regions.size() << "\n"
+               << "Fitted patches: " << patches.size() << "\n"
+               << "Accepted analytic patches: " << acceptedAnalyticPatches
+               << " (area coverage " << analyticCoverage * 100.0 << "%)\n"
+               << "Reconstruction method: " << reconstructionMethod << "\n"
+               << "Valid closed solids: " << properties.solidCount << "\n"
+               << "Faces (plane/cylinder/sphere/torus/B-spline/other): "
+               << properties.planarFaceCount << "/" << properties.cylindricalFaceCount
+               << "/" << properties.sphericalFaceCount << "/"
+               << properties.toroidalFaceCount << "/" << properties.bsplineFaceCount
+               << "/" << properties.otherSurfaceCount << "\n"
+               << "Mesh -> B-Rep RMS/max: " << distances.meshToBrep.rms << "/"
+               << distances.meshToBrep.maximum << " mm\n"
+               << "B-Rep -> mesh RMS/max: " << distances.brepToMesh.rms << "/"
+               << distances.brepToMesh.maximum << " mm\n"
+               << "STEP: " << stepPath.string() << "\n\n"
+               << "Exact feature history cannot be guaranteed from a tessellated GLB. "
+                  "Analytic surfaces are accepted only when their measured residuals pass; "
+                  "unresolved regions use fitted OpenCascade NURBS, with triangle-preserving "
+                  "fallback if surface fitting or solid assembly fails.\n";
+        if (referenceValidation) {
+            const auto& reference = *referenceValidation;
+            report << "STEP reference loaded: " << (reference.referenceLoaded ? "YES" : "NO")
+                   << "\nSampled reference RMS/max: " << reference.distances.symmetricRms << "/"
+                   << reference.distances.symmetricMaximum << " mm\n"
+                   << "Reference volume/area relative error: "
+                   << reference.properties.volumeRelativeError << "/"
+                   << reference.properties.surfaceAreaRelativeError << "\n";
         }
         {
-            std::ofstream reportStream(outputDirectory / "report.txt");
-            if (!reportStream) throw std::runtime_error("Cannot write report.txt");
-            reportStream << report.str();
+            std::ofstream stream(outputDirectory / "report.txt");
+            if (!stream) throw std::runtime_error("Cannot write report.txt");
+            stream << report.str();
         }
         std::cout << report.str();
 
-        if (commandLine.verifyExpectedStructure) {
-            const double scale = std::max(
-                mesh.bounds.diagonal(), std::numeric_limits<double>::min());
-            const bool acceptable = selected.properties.valid && selected.properties.closedSolid &&
-                selected.properties.planarFaceCount > 0 && selected.properties.sphericalFaceCount > 0 &&
-                selected.properties.otherSurfaceCount == 0 &&
-                selected.distances.symmetricRms < scale * 1.0e-3;
-            if (!acceptable) throw std::runtime_error("Structural verification failed");
+        if (command.verify) {
+            const double maximum = std::max(
+                distances.meshToBrep.maximum, distances.brepToMesh.maximum);
+            const bool acceptable = properties.valid && properties.closedSolid &&
+                properties.solidCount > 0U &&
+                distances.symmetricRms <= modelScale * 2.0e-3 &&
+                maximum <= modelScale * 1.0e-2;
+            if (!acceptable) throw std::runtime_error("Reconstruction verification failed");
+            if (command.verifyAnalytic &&
+                (properties.bsplineFaceCount > 0U || properties.otherSurfaceCount > 0U ||
+                 reconstructionMethod != "analytic_patches")) {
+                throw std::runtime_error("Analytic reconstruction verification failed");
+            }
+            if (referenceValidation &&
+                (!referenceValidation->referenceLoaded ||
+                 !referenceValidation->distancesCompared ||
+                 referenceValidation->distances.reconstructedToReference.failedSampleCount > 0U ||
+                 referenceValidation->distances.referenceToReconstructed.failedSampleCount > 0U)) {
+                throw std::runtime_error("Reference validation did not complete");
+            }
         }
         return 0;
     } catch (const std::exception& exception) {

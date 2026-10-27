@@ -10,6 +10,9 @@
 namespace recad {
 
 struct MeshLoadOptions {
+    // Multiplies positions after applying the glTF scene transform. glTF uses
+    // metres; set this to 1000 when the target CAD model is expressed in mm.
+    double linearUnitScale{1.0};
     // A positive value overrides the scale-aware weld tolerance.
     double weldTolerance{};
     double weldToleranceRelativeToDiagonal{1.0e-9};

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{5A6F04A4-6B40-4C89-87C6-EC9944A35590}</ProjectGuid>
+    <RootNamespace>reCADTests</RootNamespace>
+    <ProjectName>reCAD.Tests</ProjectName>
+    <RecadRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\'))</RecadRoot>
+    <TargetName>recad_tests</TargetName>
+  </PropertyGroup>
+  <Import Project="..\vs\NativeProject.props" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions>RECAD_COMBINED_TESTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="CudaSegmentationTests.cpp" />
+    <ClCompile Include="ReconstructionTests.cpp" />
+    <ClCompile Include="..\src\Geometry.cpp" />
+    <ClCompile Include="..\src\SurfaceFitting.cpp" />
+    <ClCompile Include="..\src\PatchReconstruction.cpp" />
+    <ClCompile Include="..\src\GeneralReconstruction.cpp" />
+    <ClCompile Include="..\src\ReferenceValidation.cpp" />
+    <CudaCompile Include="..\src\CudaGeometry.cu" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="run-integration.ps1" />
+    <None Include="run-samples.ps1" />
+  </ItemGroup>
+  <Import Project="..\vs\NativeProject.targets" />
+</Project>

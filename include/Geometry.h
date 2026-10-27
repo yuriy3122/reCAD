@@ -142,6 +142,13 @@ struct TopologyStats {
 struct Mesh {
     std::vector<Vec3d> vertices;
     std::vector<Triangle> triangles;
+    // Connected face patches from the source glTF index topology, computed
+    // before positional welding.  Exporters commonly split analytic B-Rep
+    // faces at their boundary edges, so this provenance must survive welding.
+    // Entries correspond one-for-one with triangles and are compact labels in
+    // [0, sourcePatchCount).
+    std::vector<std::uint32_t> sourcePatchLabels;
+    std::size_t sourcePatchCount{};
     std::vector<TriangleFeatures> features;
     std::vector<std::vector<std::uint32_t>> triangleNeighbors;
     std::vector<std::vector<std::uint32_t>> vertexTriangles;
