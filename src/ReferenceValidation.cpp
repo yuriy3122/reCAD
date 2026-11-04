@@ -21,6 +21,37 @@
 #include <Poly_Triangulation.hxx>
 #include <Precision.hxx>
 #include <STEPControl_Reader.hxx>
+#include <STEPConstruct_UnitContext.hxx>
+#include <StepData_StepModel.hxx>
+#include <StepData_UndefinedEntity.hxx>
+#include <Interface_ReportEntity.hxx>
+#include <Interface_UndefinedContent.hxx>
+#include <StepData_Factors.hxx>
+#include <StepRepr_GlobalUnitAssignedContext.hxx>
+#include <StepGeom_GeomRepContextAndGlobUnitAssCtxAndGlobUncertaintyAssCtx.hxx>
+#include <StepGeom_CartesianPoint.hxx>
+#include <StepShape_CsgSolid.hxx>
+#include <StepShape_CsgShapeRepresentation.hxx>
+#include <StepShape_BooleanResult.hxx>
+#include <StepShape_Block.hxx>
+#include <StepShape_Sphere.hxx>
+#include <StepShape_Torus.hxx>
+#include <StepShape_RightCircularCylinder.hxx>
+#include <StepShape_RightCircularCone.hxx>
+#include <StepShape_RightAngularWedge.hxx>
+#include <StepToGeom.hxx>
+#include <Geom_Axis1Placement.hxx>
+#include <Geom_Axis2Placement.hxx>
+#include <Geom_CartesianPoint.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakeCone.hxx>
+#include <BRepPrimAPI_MakeTorus.hxx>
+#include <BRepPrimAPI_MakeWedge.hxx>
+#include <BRepAlgoAPI_Fuse.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepAlgoAPI_Common.hxx>
 #include <Standard_Failure.hxx>
 #include <TopAbs_Orientation.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -42,6 +73,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -53,6 +85,149 @@ namespace recad {
 namespace {
 
 using ShapeMap = NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher>;
+
+// STEP's CSG representation is an explicit expression graph. OCCT parses its
+// entities but does not transfer these roots to solids. Evaluate that graph
+// with OCCT's primitive and Boolean builders for independent reference tests.
+// This adapter never receives a mesh, fit, filename rule, or expected dimensions.
+TopoDS_Shape transferCsgReference(const Handle(StepData_StepModel)& model, int& rootCount) {
+    std::vector<Handle(StepShape_CsgSolid)> roots;
+    std::vector<Handle(StepShape_BooleanResult)> operations;
+    StepData_Factors factors;
+    bool unitsFound = false;
+    for (int i = 1; i <= model->NbEntities(); ++i) {
+        const auto entity = model->Value(i);
+        if (const auto root = Handle(StepShape_CsgSolid)::DownCast(entity); !root.IsNull()) roots.push_back(root);
+        if (const auto context = Handle(StepGeom_GeomRepContextAndGlobUnitAssCtxAndGlobUncertaintyAssCtx)::DownCast(entity);
+            !context.IsNull()) {
+            STEPConstruct_UnitContext units;
+            if (units.ComputeFactors(context->GlobalUnitAssignedContext()) != 0 || !units.LengthDone()) {
+                throw std::runtime_error("CSG reference has unsupported units");
+            }
+            if (unitsFound && (factors.LengthFactor() != units.LengthFactor() ||
+                               factors.PlaneAngleFactor() != units.PlaneAngleFactor())) {
+                throw std::runtime_error("CSG reference has multiple distinct unit contexts");
+            }
+            factors.InitializeFactors(units.LengthFactor(), units.PlaneAngleFactor(), units.SolidAngleFactor());
+            unitsFound = true;
+        }
+    }
+    rootCount = static_cast<int>(roots.size());
+    if (roots.empty()) return {};
+    if (!unitsFound) throw std::runtime_error("CSG reference has no supported unit context");
+    const double scale = factors.LengthFactor();
+    std::unordered_map<const Standard_Transient*, TopoDS_Shape> shapes;
+    const auto placement = [&](const auto& position) {
+        const auto axis = StepToGeom::MakeAxis1Placement(position, factors);
+        if (axis.IsNull()) throw std::runtime_error("Invalid CSG axis placement");
+        return gp_Ax2(axis->Location(), axis->Direction());
+    };
+    for (int i = 1; i <= model->NbEntities(); ++i) {
+        const auto entity = model->Value(i);
+        TopoDS_Shape shape;
+        if (const auto block = Handle(StepShape_Block)::DownCast(entity); !block.IsNull()) {
+            const auto axis = StepToGeom::MakeAxis2Placement(block->Position(), factors);
+            if (axis.IsNull()) throw std::runtime_error("Invalid CSG block placement");
+            shape = BRepPrimAPI_MakeBox(axis->Ax2(), block->X() * scale, block->Y() * scale, block->Z() * scale).Shape();
+        } else if (const auto sphere = Handle(StepShape_Sphere)::DownCast(entity); !sphere.IsNull()) {
+            const auto point = StepToGeom::MakeCartesianPoint(Handle(StepGeom_CartesianPoint)::DownCast(sphere->Centre()), factors);
+            if (point.IsNull()) throw std::runtime_error("Invalid CSG sphere centre");
+            shape = BRepPrimAPI_MakeSphere(point->Pnt(), sphere->Radius() * scale).Shape();
+        } else if (const auto cylinder = Handle(StepShape_RightCircularCylinder)::DownCast(entity); !cylinder.IsNull()) {
+            shape = BRepPrimAPI_MakeCylinder(placement(cylinder->Position()), cylinder->Radius() * scale,
+                                             cylinder->Height() * scale).Shape();
+        } else if (const auto cone = Handle(StepShape_RightCircularCone)::DownCast(entity); !cone.IsNull()) {
+            const double radius = cone->Radius() * scale;
+            const double height = cone->Height() * scale;
+            // ISO 10303-42 locates the base in the NEGATIVE axis direction
+            // from position.location, which is the truncated top (or apex).
+            gp_Ax2 axis = placement(cone->Position());
+            axis.SetLocation(axis.Location().Translated(gp_Vec(axis.Direction()) * -height));
+            const double baseRadius = radius + height * std::tan(cone->SemiAngle() * factors.PlaneAngleFactor());
+            shape = BRepPrimAPI_MakeCone(axis, baseRadius, radius, height).Shape();
+        } else if (const auto torus = Handle(StepShape_Torus)::DownCast(entity); !torus.IsNull()) {
+            shape = BRepPrimAPI_MakeTorus(placement(torus->Position()), torus->MajorRadius() * scale,
+                                          torus->MinorRadius() * scale).Shape();
+        } else if (const auto wedge = Handle(StepShape_RightAngularWedge)::DownCast(entity); !wedge.IsNull()) {
+            const auto axis = StepToGeom::MakeAxis2Placement(wedge->Position(), factors);
+            if (axis.IsNull()) throw std::runtime_error("Invalid CSG wedge placement");
+            shape = BRepPrimAPI_MakeWedge(axis->Ax2(), wedge->X() * scale, wedge->Y() * scale,
+                                          wedge->Z() * scale, wedge->Ltx() * scale).Shape();
+        } else if (const auto operation = Handle(StepShape_BooleanResult)::DownCast(entity); !operation.IsNull()) {
+            operations.push_back(operation);
+        }
+        if (!shape.IsNull()) shapes.emplace(entity.get(), shape);
+    }
+    const auto operandEntity = [&](const Handle(StepShape_BooleanResult)& operation, int parameter) -> Handle(Standard_Transient) {
+        // OCCT's Boolean reader only types SolidModel operands; the native
+        // parser retains primitive/Boolean references in the literal record.
+        const auto report = model->ReportEntity(model->Number(operation));
+        if (!report.IsNull() && report->HasContent()) {
+            const auto record = Handle(StepData_UndefinedEntity)::DownCast(report->Content());
+            if (!record.IsNull() && record->UndefinedContent()->IsParamEntity(parameter)) {
+                return record->UndefinedContent()->ParamEntity(parameter);
+            }
+        }
+        const auto operand = parameter == 3 ? operation->FirstOperand() : operation->SecondOperand();
+        if (!operand.BooleanResult().IsNull()) return operand.BooleanResult();
+        if (!operand.CsgPrimitive().Value().IsNull()) return operand.CsgPrimitive().Value();
+        if (!operand.SolidModel().IsNull()) return operand.SolidModel();
+        throw std::runtime_error("Unsupported STEP CSG operand");
+    };
+    // A bounded topological evaluation also handles forward references. A pass
+    // without progress is an invalid cycle or unsupported dependency.
+    while (!operations.empty()) {
+        bool progressed = false;
+        for (auto iterator = operations.begin(); iterator != operations.end();) {
+            const auto& operation = *iterator;
+            const auto left = shapes.find(operandEntity(operation, 3).get());
+            const auto right = shapes.find(operandEntity(operation, 4).get());
+            if (left == shapes.end() || right == shapes.end()) { ++iterator; continue; }
+            TopoDS_Shape shape;
+            switch (operation->Operator()) {
+            case StepShape_boUnion: {
+                BRepAlgoAPI_Fuse builder(left->second, right->second);
+                if (!builder.IsDone()) throw std::runtime_error("CSG union failed");
+                builder.SimplifyResult();
+                shape = builder.Shape();
+                break;
+            }
+            case StepShape_boDifference: {
+                BRepAlgoAPI_Cut builder(left->second, right->second);
+                if (!builder.IsDone()) throw std::runtime_error("CSG difference failed");
+                builder.SimplifyResult();
+                shape = builder.Shape();
+                break;
+            }
+            case StepShape_boIntersection: {
+                BRepAlgoAPI_Common builder(left->second, right->second);
+                if (!builder.IsDone()) throw std::runtime_error("CSG intersection failed");
+                builder.SimplifyResult();
+                shape = builder.Shape();
+                break;
+            }
+            default: throw std::runtime_error("Unsupported CSG Boolean operator");
+            }
+            shapes.emplace(operation.get(), shape);
+            iterator = operations.erase(iterator);
+            progressed = true;
+        }
+        if (!progressed) throw std::runtime_error("Unresolved or cyclic CSG expression graph");
+    }
+    BRep_Builder builder;
+    TopoDS_Compound result;
+    builder.MakeCompound(result);
+    for (const auto& root : roots) {
+        const auto expression = root->TreeRootExpression();
+        const Handle(Standard_Transient) entity = !expression.BooleanResult().IsNull()
+            ? Handle(Standard_Transient)(expression.BooleanResult()) : expression.CsgPrimitive().Value();
+        const auto found = shapes.find(entity.get());
+        if (found == shapes.end()) throw std::runtime_error("Unsupported CSG root expression");
+        if (roots.size() == 1) return found->second;
+        builder.Add(result, found->second);
+    }
+    return result;
+}
 
 struct SurfaceTriangle {
     Vec3d a;
@@ -155,8 +330,8 @@ ValidationShapeMetrics inspectShape(const TopoDS_Shape& shape,
     try {
         GProp_GProps volumeProperties;
         GProp_GProps surfaceProperties;
-        BRepGProp::VolumeProperties(shape, volumeProperties);
-        BRepGProp::SurfaceProperties(shape, surfaceProperties);
+        BRepGProp::VolumeProperties(shape, volumeProperties, 1.0e-9);
+        BRepGProp::SurfaceProperties(shape, surfaceProperties, 1.0e-9);
         result.volume = std::abs(volumeProperties.Mass());
         result.surfaceArea = std::abs(surfaceProperties.Mass());
     } catch (const Standard_Failure& error) {
@@ -272,21 +447,15 @@ Vec3d surfacePoint(const SurfaceTriangle& triangle,
                    double wa,
                    double wb,
                    double wc) {
-    if (triangle.hasUv) {
-        const double u = triangle.uv[0].X() * wa + triangle.uv[1].X() * wb +
-                         triangle.uv[2].X() * wc;
-        const double v = triangle.uv[0].Y() * wa + triangle.uv[1].Y() * wb +
-                         triangle.uv[2].Y() * wc;
-        const BRepAdaptor_Surface exactSurface(triangle.face, true);
-        return toVec(exactSurface.Value(u, v));
+    // Interpolating UV coordinates can cross a periodic seam or a trimmed-out
+    // hole. Project the chordal sample onto its own trimmed face instead.
+    const Vec3d chord = triangle.a * wa + triangle.b * wb + triangle.c * wc;
+    const auto vertex = BRepBuilderAPI_MakeVertex(toPoint(chord)).Vertex();
+    BRepExtrema_DistShapeShape projection(vertex, triangle.face);
+    if (!projection.IsDone() || projection.NbSolution() == 0) {
+        throw std::runtime_error("Cannot project a validation sample onto its source face");
     }
-
-    // OCCT triangulations normally carry UV nodes.  If an imported custom
-    // triangulation does not, use an exact mesh vertex instead of a point in
-    // the interior of the chordal triangle, which might not lie on the face.
-    if (wa >= wb && wa >= wc) return triangle.a;
-    if (wb >= wc) return triangle.b;
-    return triangle.c;
+    return toVec(projection.PointOnShape2(1));
 }
 
 Vec3d areaUniformPoint(const SurfaceTriangle& triangle, std::size_t sequenceIndex) {
@@ -445,10 +614,12 @@ SampledSurfaceDistance measureSamples(const SampleSet& samples,
     double weightedMean = 0.0;
     double weightedSquares = 0.0;
     double successfulWeight = 0.0;
+    BRepExtrema_DistShapeShape query;
+    query.LoadS2(boundary);
     for (const SurfaceSample& sample : samples.samples) {
         try {
             const TopoDS_Vertex vertex = BRepBuilderAPI_MakeVertex(toPoint(sample.point));
-            BRepExtrema_DistShapeShape query(vertex, boundary);
+            query.LoadS1(vertex);
             query.Perform();
             if (!query.IsDone() || query.NbSolution() == 0) {
                 ++result.failedSampleCount;
@@ -463,7 +634,11 @@ SampledSurfaceDistance measureSamples(const SampleSet& samples,
             successfulWeight += sample.weight;
             weightedMean += sample.weight * distance;
             weightedSquares += sample.weight * distance * distance;
-            result.maximum = std::max(result.maximum, distance);
+            if (distance > result.maximum) {
+                result.maximum = distance;
+                result.maximumPoint = sample.point;
+                result.maximumOnBoundary = sample.weight == 0.0;
+            }
         } catch (const Standard_Failure&) {
             ++result.failedSampleCount;
         }
@@ -667,13 +842,17 @@ ReferenceValidationResult validateAgainstStepReference(
                 readStatusName(status) + ")");
             return failure;
         }
-        const int transferredRoots = reader.TransferRoots();
+        int transferredRoots = 0;
+        TopoDS_Shape reference = transferCsgReference(reader.StepModel(), transferredRoots);
+        if (transferredRoots == 0) {
+            transferredRoots = reader.TransferRoots();
+            reference = reader.OneShape();
+        }
         if (transferredRoots <= 0) {
             failure.diagnostics.emplace_back(
                 "OpenCascade read the STEP file but transferred no roots");
             return failure;
         }
-        TopoDS_Shape reference = reader.OneShape();
         if (reference.IsNull()) {
             failure.diagnostics.emplace_back(
                 "OpenCascade STEP transfer returned a null shape");

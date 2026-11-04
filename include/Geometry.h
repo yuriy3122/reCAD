@@ -142,6 +142,9 @@ struct TopologyStats {
 struct Mesh {
     std::vector<Vec3d> vertices;
     std::vector<Triangle> triangles;
+    // Optional glTF shading normals per triangle corner, retained across welding
+    // so sharp edges do not average together. Zero denotes a missing normal.
+    std::vector<std::array<Vec3d, 3>> cornerNormals;
     // Connected face patches from the source glTF index topology, computed
     // before positional welding.  Exporters commonly split analytic B-Rep
     // faces at their boundary edges, so this provenance must survive welding.

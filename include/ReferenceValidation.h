@@ -83,6 +83,8 @@ struct SampledSurfaceDistance {
     double mean{};
     double rms{};
     double maximum{};
+    Vec3d maximumPoint;
+    bool maximumOnBoundary{};
     double normalizedMean{};
     double normalizedRms{};
     double normalizedMaximum{};

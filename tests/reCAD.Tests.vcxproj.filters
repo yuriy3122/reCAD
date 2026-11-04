@@ -8,9 +8,10 @@
     <ClCompile Include="CudaSegmentationTests.cpp"><Filter>Tests</Filter></ClCompile>
     <ClCompile Include="ReconstructionTests.cpp"><Filter>Tests</Filter></ClCompile>
     <ClCompile Include="..\src\Geometry.cpp"><Filter>Implementation</Filter></ClCompile>
+    <ClCompile Include="..\src\Distance.cpp"><Filter>Implementation</Filter></ClCompile>
     <ClCompile Include="..\src\SurfaceFitting.cpp"><Filter>Implementation</Filter></ClCompile>
+    <ClCompile Include="..\src\GraphCut.cpp"><Filter>Implementation</Filter></ClCompile>
     <ClCompile Include="..\src\PatchReconstruction.cpp"><Filter>Implementation</Filter></ClCompile>
-    <ClCompile Include="..\src\GeneralReconstruction.cpp"><Filter>Implementation</Filter></ClCompile>
     <ClCompile Include="..\src\ReferenceValidation.cpp"><Filter>Implementation</Filter></ClCompile>
     <CudaCompile Include="..\src\CudaGeometry.cu"><Filter>Implementation</Filter></CudaCompile>
   </ItemGroup>

@@ -1,4 +1,5 @@
 #include "SurfaceFitting.h"
+#include "GraphCut.h"
 
 #include <Eigen/Cholesky>
 #include <Eigen/Core>
@@ -12,6 +13,7 @@
 #include <iterator>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -25,6 +27,7 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 struct WeightedPoint {
     Vec3d point{};
     double weight{};
+    Vec3d normal{};
 };
 
 struct PatchSamples {
@@ -86,7 +89,35 @@ struct Candidate {
     if (options.positionTolerance > 0.0) return options.positionTolerance;
     const double scale = std::max(mesh.bounds.diagonal(),
                                   std::numeric_limits<double>::min());
+    // CAD tessellators may insert points on chords before Draco encoding. Such
+    // points are inside the smooth surface, even with exact exporter normals.
+    // Estimate that positional uncertainty from chord length and normal turn:
+    // sag = (chord / 2) * tan(turn / 4). Ignore flat edges and use a robust
+    // quantile so isolated normal discontinuities cannot set the fit budget.
+    std::vector<double> chordSags;
+    if (mesh.cornerNormals.size() == mesh.triangles.size()) {
+        for (std::size_t i = 0; i < mesh.triangles.size(); ++i) {
+            for (unsigned edge = 0; edge < 3; ++edge) {
+                const unsigned next = (edge + 1) % 3;
+                const Vec3d a = normalized(mesh.cornerNormals[i][edge]);
+                const Vec3d b = normalized(mesh.cornerNormals[i][next]);
+                if (norm(a) == 0.0 || norm(b) == 0.0) continue;
+                const double turn = std::acos(clampUnit(dot(a, b)));
+                if (turn < 0.002 || turn > kPi * 0.5) continue;
+                const double chord = norm(mesh.vertices[mesh.triangles[i][edge]] -
+                                          mesh.vertices[mesh.triangles[i][next]]);
+                chordSags.push_back(chord * 0.5 * std::tan(turn * 0.25));
+            }
+        }
+    }
+    double chordUncertainty = 0.0;
+    if (!chordSags.empty()) {
+        const auto quantile = chordSags.begin() + static_cast<std::ptrdiff_t>(chordSags.size() * 9 / 10);
+        std::nth_element(chordSags.begin(), quantile, chordSags.end());
+        chordUncertainty = std::min(*quantile * 0.5, scale * 1.0e-3);
+    }
     return std::max({mesh.weldTolerance * 8.0,
+                     chordUncertainty,
                      scale * 2.0e-5,
                      std::numeric_limits<double>::epsilon() * scale * 256.0});
 }
@@ -115,6 +146,7 @@ void validateOptions(const SurfaceFitOptions& options) {
         !std::isfinite(options.normalScoreWeight) || options.normalScoreWeight < 0.0 ||
         !std::isfinite(options.complexityPenaltyWeight) ||
         options.complexityPenaltyWeight < 0.0 ||
+        !std::isfinite(options.boundaryRegularizationWeight) || options.boundaryRegularizationWeight < 0.0 ||
         options.maximumExtractedPatchesPerRegion == 0U ||
         options.maximumHypothesisSeeds == 0U ||
         options.hypothesisNeighborhoodTriangles < 2U ||
@@ -152,11 +184,16 @@ void validateOptions(const SurfaceFitOptions& options) {
         result.area += feature.area;
         result.centroid += feature.centroid * feature.area;
         const double weight = feature.area / 3.0;
+        unsigned corner = 0;
         for (const std::uint32_t vertex : mesh.triangles[triangleIndex].vertices) {
             if (vertex >= mesh.vertices.size()) {
                 throw std::out_of_range("Surface-patch vertex index is out of range");
             }
-            result.points.push_back({mesh.vertices[vertex], weight});
+            const Vec3d normal = mesh.cornerNormals.size() == mesh.triangles.size()
+                && norm(mesh.cornerNormals[triangleIndex][corner]) > 0.0
+                ? mesh.cornerNormals[triangleIndex][corner] : feature.normal;
+            result.points.push_back({mesh.vertices[vertex], weight, normal});
+            ++corner;
         }
     }
     if (result.area > 0.0) result.centroid /= result.area;
@@ -169,6 +206,7 @@ template <typename PositionResidual, typename SurfaceNormal>
     const PatchSamples& samples,
     double positionTolerance,
     double normalTolerance,
+    double smoothNormalTolerance,
     PositionResidual&& positionResidual,
     SurfaceNormal&& surfaceNormal) {
     SurfaceResidualSummary result;
@@ -206,6 +244,7 @@ template <typename PositionResidual, typename SurfaceNormal>
         const Vec3d predicted = normalized(surfaceNormal(feature.centroid));
         double angle = std::numeric_limits<double>::infinity();
         double excessAngle = angle;
+        double observationTolerance = normalTolerance;
         if (norm(predicted) > 0.0 && isFinite(predicted)) {
             angle = std::acos(clampUnit(std::abs(dot(feature.normal, predicted))));
             double facetNormalVariation = 0.0;
@@ -217,6 +256,26 @@ template <typename PositionResidual, typename SurfaceNormal>
                 }
             }
             excessAngle = std::max(0.0, angle - facetNormalVariation);
+            // Exported corner normals measure the underlying smooth surface,
+            // whereas a coarse facet normal measures its chord. Keep the two
+            // observations distinct and use smooth normals when supplied.
+            if (mesh.cornerNormals.size() == mesh.triangles.size()) {
+                double cornerSquares = 0.0;
+                unsigned count = 0;
+                for (std::size_t corner = 0; corner < 3; ++corner) {
+                    const Vec3d observed = normalized(mesh.cornerNormals[triangleIndex][corner]);
+                    if (norm(observed) == 0.0) continue;
+                    const Vec3d expected = normalized(surfaceNormal(
+                        mesh.vertices[mesh.triangles[triangleIndex][corner]]));
+                    const double error = std::acos(clampUnit(std::abs(dot(observed, expected))));
+                    cornerSquares += error * error;
+                    ++count;
+                }
+                if (count == 3) {
+                    angle = excessAngle = std::sqrt(cornerSquares / count);
+                    observationTolerance = std::min(normalTolerance, smoothNormalTolerance);
+                }
+            }
             normalWeight += feature.area;
             normalSquares += feature.area * angle * angle;
             normalExcessSquares += feature.area * excessAngle * excessAngle;
@@ -234,7 +293,7 @@ template <typename PositionResidual, typename SurfaceNormal>
                 break;
             }
         }
-        if (positionInlier && excessAngle <= normalTolerance) inlierArea += feature.area;
+        if (positionInlier && excessAngle <= observationTolerance) inlierArea += feature.area;
     }
     if (result.normalSampleCount > 0U && normalWeight > 0.0) {
         result.normalRmsRadians = std::sqrt(std::max(0.0, normalSquares / normalWeight));
@@ -254,6 +313,7 @@ template <typename PositionResidual, typename SurfaceNormal>
     switch (kind) {
     case SurfaceKind::Plane: return 3U;
     case SurfaceKind::Cylinder: return 5U;
+    case SurfaceKind::Cone: return 6U;
     case SurfaceKind::Sphere: return 4U;
     case SurfaceKind::Torus: return 7U;
     default: return 0U;
@@ -272,7 +332,10 @@ template <typename PositionResidual, typename SurfaceNormal>
         2U, residuals.positionSampleCount + residuals.normalSampleCount));
     const double penalty = options.complexityPenaltyWeight *
         static_cast<double>(parameterCount(kind)) * std::log(observations) / observations;
-    return std::log(std::max(meanNormalizedSquare, 1.0e-30)) + penalty;
+    // Residuals below the measurement tolerance carry no evidence for extra
+    // parameters. A noise floor prevents a cylinder interpolating four nearly
+    // coplanar quantized points from defeating the planar model.
+    return std::log1p(meanNormalizedSquare) + penalty;
 }
 
 [[nodiscard]] bool passesTolerance(const SurfaceResidualSummary& residuals,
@@ -332,7 +395,7 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
     // revolution axis independently. Other planar source patches provide
     // rotation-invariant shared-frame hypotheses, never imposed constraints.
     if (mesh.sourcePatchLabels.size() == mesh.triangles.size() &&
-        mesh.sourcePatchCount > 1U) {
+        mesh.sourcePatchCount > 1U && mesh.sourcePatchCount <= mesh.triangles.size() / 2U) {
         std::vector<Vec3d> normalSums(mesh.sourcePatchCount);
         std::vector<double> areas(mesh.sourcePatchCount, 0.0);
         for (std::size_t i = 0; i < mesh.triangles.size(); ++i) {
@@ -376,6 +439,19 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
         for (Eigen::Index i = 0; i < 3; ++i) appendAxis(axes, vec3(normalSolver.eigenvectors().col(i)));
     }
 
+    // Cone normals lie on a small circle on the unit sphere. Its centered
+    // covariance has the revolution axis as its least-variance direction.
+    Eigen::Vector3d meanNormal = Eigen::Vector3d::Zero();
+    for (const auto& sample : samples.points) meanNormal += sample.weight * eigenVector(sample.normal);
+    meanNormal /= samples.area;
+    Eigen::Matrix3d centeredNormals = Eigen::Matrix3d::Zero();
+    for (const auto& sample : samples.points) {
+        const Eigen::Vector3d d = eigenVector(sample.normal) - meanNormal;
+        centeredNormals.noalias() += sample.weight * d * d.transpose();
+    }
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> coneAxes(centeredNormals);
+    if (coneAxes.info() == Eigen::Success) appendAxis(axes, vec3(coneAxes.eigenvectors().col(0)));
+
     // Crossed normals are strong cylinder-axis hypotheses. Limiting this to a
     // deterministic representative set avoids quadratic growth on dense meshes.
     for (std::size_t i = 0; i < representativeNormals.size(); ++i) {
@@ -392,7 +468,7 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
     const Mesh& mesh, const PatchSamples& samples, const Plane& plane,
     double positionTolerance, const SurfaceFitOptions& options) {
     return evaluateModel(mesh, samples, positionTolerance,
-        options.normalToleranceRadians,
+        options.normalToleranceRadians, options.smoothNormalToleranceRadians,
         [&plane](const Vec3d& point) { return plane.signedDistance(point); },
         [&plane](const Vec3d&) { return plane.normal; });
 }
@@ -401,7 +477,7 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
     const Mesh& mesh, const PatchSamples& samples, const SphereSurface& sphere,
     double positionTolerance, const SurfaceFitOptions& options) {
     return evaluateModel(mesh, samples, positionTolerance,
-        options.normalToleranceRadians,
+        options.normalToleranceRadians, options.smoothNormalToleranceRadians,
         [&sphere](const Vec3d& point) {
             return norm(point - sphere.center) - sphere.radius;
         },
@@ -429,9 +505,23 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
     const Mesh& mesh, const PatchSamples& samples, const CylinderSurface& cylinder,
     double positionTolerance, const SurfaceFitOptions& options) {
     return evaluateModel(mesh, samples, positionTolerance,
-        options.normalToleranceRadians,
+        options.normalToleranceRadians, options.smoothNormalToleranceRadians,
         [&cylinder](const Vec3d& point) { return cylinderResidual(cylinder, point); },
         [&cylinder](const Vec3d& point) { return cylinderNormal(cylinder, point); });
+}
+
+[[nodiscard]] double coneResidual(const ConeSurface& cone, const Vec3d& point) {
+    const Vec3d d = point - cone.apex;
+    const double height = dot(d, cone.axisDirection);
+    return norm(d - cone.axisDirection * height) * std::cos(cone.semiAngle) -
+           height * std::sin(cone.semiAngle);
+}
+
+[[nodiscard]] Vec3d coneNormal(const ConeSurface& cone, const Vec3d& point) {
+    const Vec3d d = point - cone.apex;
+    const double height = dot(d, cone.axisDirection);
+    return normalized(d - cone.axisDirection * height) * std::cos(cone.semiAngle) -
+           cone.axisDirection * std::sin(cone.semiAngle);
 }
 
 [[nodiscard]] double torusResidual(const TorusSurface& torus, const Vec3d& point) {
@@ -458,7 +548,7 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
     const Mesh& mesh, const PatchSamples& samples, const TorusSurface& torus,
     double positionTolerance, const SurfaceFitOptions& options) {
     return evaluateModel(mesh, samples, positionTolerance,
-        options.normalToleranceRadians,
+        options.normalToleranceRadians, options.smoothNormalToleranceRadians,
         [&torus](const Vec3d& point) { return torusResidual(torus, point); },
         [&torus](const Vec3d& point) { return torusNormal(torus, point); });
 }
@@ -901,6 +991,120 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
     return best;
 }
 
+// Initialize a surface of revolution from radial normal lines, then regress
+// radius against axial position. Refine the six cone parameters by robust LM
+// using orthogonal point-to-cone distances, independent of pose and units.
+[[nodiscard]] Candidate coneCandidate(
+    const Mesh& mesh, const PatchSamples& samples, double tolerance,
+    const SurfaceFitOptions& options, const std::vector<Vec3d>& axes) {
+    Candidate best;
+    best.kind = SurfaceKind::Cone;
+    std::vector<std::pair<double, ConeSurface>> initializations;
+    for (const auto& direction : axes) {
+        const Vec3d axis = canonicalDirection(direction);
+        const auto [x, y] = perpendicularFrame(axis);
+        Eigen::Matrix2d matrix = Eigen::Matrix2d::Zero();
+        Eigen::Vector2d right = Eigen::Vector2d::Zero();
+        for (const auto& sample : samples.points) {
+            const Vec3d d = sample.point - samples.centroid;
+            const Eigen::Vector2d row(dot(sample.normal, y), -dot(sample.normal, x));
+            matrix.noalias() += sample.weight * row * row.transpose();
+            right.noalias() += sample.weight * row *
+                (row[0] * dot(d, x) + row[1] * dot(d, y));
+        }
+        const Eigen::Vector2d center = matrix.completeOrthogonalDecomposition().solve(right);
+        if (!center.allFinite()) continue;
+        const Vec3d axisPoint = samples.centroid + x * center[0] + y * center[1];
+        Eigen::Matrix2d regression = Eigen::Matrix2d::Zero();
+        Eigen::Vector2d values = Eigen::Vector2d::Zero();
+        for (const auto& sample : samples.points) {
+            const Vec3d d = sample.point - axisPoint;
+            const double z = dot(d, axis);
+            const Eigen::Vector2d row(1.0, z);
+            regression.noalias() += sample.weight * row * row.transpose();
+            values.noalias() += sample.weight * row * norm(d - axis * z);
+        }
+        const Eigen::Vector2d line = regression.ldlt().solve(values);
+        if (!line.allFinite() || std::abs(line[1]) < 0.005 || line[0] <= 0.0) continue;
+        ConeSurface cone{axisPoint - axis * (line[0] / line[1]),
+                         axis * (line[1] > 0.0 ? 1.0 : -1.0),
+                         std::atan(std::abs(line[1]))};
+        const double cost = huberCost(samples.points, tolerance,
+            [&](const Vec3d& p) { return coneResidual(cone, p); });
+        if (std::isfinite(cost)) initializations.emplace_back(cost, cone);
+    }
+    std::sort(initializations.begin(), initializations.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    if (initializations.size() > 4) initializations.resize(4);
+    const double scale = std::max(mesh.bounds.diagonal(), tolerance);
+    for (const auto& initialization : initializations) {
+        ConeSurface model = initialization.second;
+        double cost = initialization.first;
+        double damping = 1.0e-5;
+        for (std::size_t iteration = 0; iteration < options.maximumRefinementIterations; ++iteration) {
+            const auto [x, y] = perpendicularFrame(model.axisDirection);
+            const auto displaced = [&](const Eigen::Matrix<double, 6, 1>& step) {
+                ConeSurface c = model;
+                c.apex += Vec3d{step[0], step[1], step[2]} * scale;
+                c.axisDirection = normalized(c.axisDirection + x * step[3] + y * step[4]);
+                c.semiAngle += step[5];
+                return c;
+            };
+            Eigen::Matrix<double, 6, 6> matrix = Eigen::Matrix<double, 6, 6>::Zero();
+            Eigen::Matrix<double, 6, 1> gradient = Eigen::Matrix<double, 6, 1>::Zero();
+            for (const auto& sample : samples.points) {
+                const double residual = coneResidual(model, sample.point);
+                Eigen::Matrix<double, 6, 1> jacobian;
+                for (int j = 0; j < 6; ++j) {
+                    Eigen::Matrix<double, 6, 1> delta = Eigen::Matrix<double, 6, 1>::Zero();
+                    delta[j] = 1.0e-6;
+                    jacobian[j] = (coneResidual(displaced(delta), sample.point) -
+                                   coneResidual(displaced(-delta), sample.point)) / 2.0e-6;
+                }
+                const double weight = sample.weight * huberWeight(residual, tolerance);
+                matrix.noalias() += weight * jacobian * jacobian.transpose();
+                gradient.noalias() += weight * jacobian * residual;
+            }
+            bool improved = false;
+            for (unsigned attempt = 0; attempt < 12; ++attempt) {
+                Eigen::Matrix<double, 6, 6> damped = matrix;
+                for (int j = 0; j < 6; ++j) damped(j, j) += damping * std::max(matrix(j, j), 1.0e-12);
+                const Eigen::Matrix<double, 6, 1> step = damped.ldlt().solve(-gradient);
+                if (!step.allFinite()) { damping *= 10.0; continue; }
+                const ConeSurface next = displaced(step);
+                if (next.semiAngle <= 0.005 || next.semiAngle >= kPi * 0.5 - 0.005) {
+                    damping *= 10.0;
+                    continue;
+                }
+                const double nextCost = huberCost(samples.points, tolerance,
+                    [&](const Vec3d& p) { return coneResidual(next, p); });
+                if (nextCost <= cost) {
+                    model = next;
+                    cost = nextCost;
+                    damping = std::max(1.0e-15, damping * 0.25);
+                    improved = step.norm() > options.convergenceTolerance;
+                    break;
+                }
+                damping *= 10.0;
+            }
+            if (!improved) break;
+        }
+        Candidate candidate;
+        candidate.kind = SurfaceKind::Cone;
+        candidate.parameters = model;
+        candidate.residuals = evaluateModel(mesh, samples, tolerance,
+            options.normalToleranceRadians, options.smoothNormalToleranceRadians,
+            [&](const Vec3d& p) { return coneResidual(model, p); },
+            [&](const Vec3d& p) { return coneNormal(model, p); });
+        candidate.score = modelScore(candidate.kind, candidate.residuals, tolerance, options);
+        candidate.accepted = passesTolerance(candidate.residuals, tolerance, options);
+        candidate.diagnostic = candidate.accepted ? "ok" : "Cone residual exceeds tolerance";
+        if (candidate.accepted > best.accepted ||
+            (candidate.accepted == best.accepted && candidate.score < best.score)) best = candidate;
+    }
+    return best;
+}
+
 [[nodiscard]] std::vector<Candidate> analyticCandidates(
     const Mesh& mesh,
     const PatchSamples& samples,
@@ -908,7 +1112,16 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
     const SurfaceFitOptions& options,
     std::size_t maximumAxisHypotheses = 0U) {
     std::vector<Candidate> result;
-    result.reserve(4U);
+    result.reserve(5U);
+    const auto canImprove = [&](SurfaceKind kind) {
+        const double observations = static_cast<double>(std::max<std::size_t>(
+            2, samples.points.size() + samples.triangles.size()));
+        const double lowerBound = options.complexityPenaltyWeight *
+            static_cast<double>(parameterCount(kind)) * std::log(observations) / observations;
+        return std::none_of(result.begin(), result.end(), [&](const Candidate& c) {
+            return c.accepted && c.score <= lowerBound;
+        });
+    };
     if (options.enablePlanes) {
         result.push_back(planeCandidate(mesh, samples, positionTolerance, options));
         if (result.back().accepted &&
@@ -921,19 +1134,27 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
             result.back().residuals.positionMax < positionTolerance * 0.05) return result;
     }
     std::vector<Vec3d> axes;
-    if (options.enableCylinders || options.enableTori) {
+    if (options.enableCylinders || options.enableCones || options.enableTori) {
         axes = candidateAxes(mesh, samples);
         if (maximumAxisHypotheses > 0U && axes.size() > maximumAxisHypotheses) {
             axes.resize(maximumAxisHypotheses);
         }
     }
     if (options.enableCylinders) {
+        if (!canImprove(SurfaceKind::Cylinder)) return result;
         result.push_back(cylinderCandidate(
             mesh, samples, positionTolerance, options, axes));
         if (result.back().accepted &&
             result.back().residuals.positionMax < positionTolerance * 0.05) return result;
     }
+    if (options.enableCones) {
+        if (!canImprove(SurfaceKind::Cone)) return result;
+        result.push_back(coneCandidate(mesh, samples, positionTolerance, options, axes));
+        if (result.back().accepted &&
+            result.back().residuals.positionMax < positionTolerance * 0.05) return result;
+    }
     if (options.enableTori) {
+        if (!canImprove(SurfaceKind::Torus)) return result;
         result.push_back(torusCandidate(
             mesh, samples, positionTolerance, options, axes));
     }
@@ -947,6 +1168,8 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
         return std::get<Plane>(candidate.parameters).signedDistance(point);
     case SurfaceKind::Cylinder:
         return cylinderResidual(std::get<CylinderSurface>(candidate.parameters), point);
+    case SurfaceKind::Cone:
+        return coneResidual(std::get<ConeSurface>(candidate.parameters), point);
     case SurfaceKind::Sphere: {
         const SphereSurface& sphere = std::get<SphereSurface>(candidate.parameters);
         return norm(point - sphere.center) - sphere.radius;
@@ -964,6 +1187,8 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
         return std::get<Plane>(candidate.parameters).normal;
     case SurfaceKind::Cylinder:
         return cylinderNormal(std::get<CylinderSurface>(candidate.parameters), point);
+    case SurfaceKind::Cone:
+        return coneNormal(std::get<ConeSurface>(candidate.parameters), point);
     case SurfaceKind::Sphere:
         return normalized(point - std::get<SphereSurface>(candidate.parameters).center);
     case SurfaceKind::Torus:
@@ -977,7 +1202,8 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
                                          std::uint32_t triangleIndex,
                                          const Candidate& candidate,
                                          double positionTolerance,
-                                         double normalTolerance) {
+                                         double normalTolerance,
+                                         double smoothNormalTolerance) {
     if (triangleIndex >= mesh.triangles.size() ||
         candidate.parameters.index() == 0U) {
         return false;
@@ -987,11 +1213,26 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
     const Vec3d predicted = normalized(candidateNormal(candidate, feature.centroid));
     if (norm(predicted) == 0.0 || !isFinite(predicted)) return false;
     const double angle = std::acos(clampUnit(std::abs(dot(feature.normal, predicted))));
-    if (!std::isfinite(angle) || angle > normalTolerance) return false;
+    double variation = 0.0;
+    for (const auto vertex : mesh.triangles[triangleIndex].vertices) {
+        const Vec3d expected = normalized(candidateNormal(candidate, mesh.vertices[vertex]));
+        variation = std::max(variation, std::acos(clampUnit(dot(expected, predicted))));
+    }
+    if (!std::isfinite(angle) || angle > normalTolerance + variation) return false;
     for (const std::uint32_t vertex : mesh.triangles[triangleIndex].vertices) {
         const double residual = std::abs(candidatePositionResidual(
             candidate, mesh.vertices[vertex]));
         if (!std::isfinite(residual) || residual > positionTolerance) return false;
+    }
+    if (mesh.cornerNormals.size() == mesh.triangles.size()) {
+        for (std::size_t corner = 0; corner < 3; ++corner) {
+            const Vec3d observed = normalized(mesh.cornerNormals[triangleIndex][corner]);
+            if (norm(observed) == 0.0) continue;
+            const Vec3d expected = normalized(candidateNormal(candidate,
+                mesh.vertices[mesh.triangles[triangleIndex][corner]]));
+            if (std::acos(clampUnit(std::abs(dot(observed, expected)))) >
+                std::min(normalTolerance, smoothNormalTolerance)) return false;
+        }
     }
     return true;
 }
@@ -1113,7 +1354,8 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
             options.normalToleranceRadians * options.hypothesisInlierToleranceFactor);
         for (const std::uint32_t triangle : region) {
             if (triangleFitsCandidate(mesh, triangle, hypothesis,
-                                      positionThreshold, normalThreshold)) {
+                                      positionThreshold, normalThreshold,
+                                      options.smoothNormalToleranceRadians * options.hypothesisInlierToleranceFactor)) {
                 inliers.push_back(triangle);
             }
         }
@@ -1249,6 +1491,166 @@ void appendAxis(std::vector<Vec3d>& axes, const Vec3d& candidate) {
     return result;
 }
 
+// Minimize an area-weighted surface data term plus boundary length using
+// metric Potts alpha expansion (Boykov/Veksler/Zabih, PAMI 2001).
+// Complexity is charged per supporting observation, so tiny planar facets do
+// not defeat a well-supported curved surface merely by interpolating vertices.
+std::vector<SurfacePatchFit> refineSurfaceLabels(
+    const Mesh& mesh, const std::vector<SurfacePatchFit>& seeds,
+    const SurfaceFitOptions& options) {
+    const auto familyOptions = [&](SurfaceKind kind) {
+        auto fit = options;
+        fit.enablePlanes = kind == SurfaceKind::Plane;
+        fit.enableSpheres = kind == SurfaceKind::Sphere;
+        fit.enableCylinders = kind == SurfaceKind::Cylinder;
+        fit.enableCones = kind == SurfaceKind::Cone;
+        fit.enableTori = kind == SurfaceKind::Torus;
+        return fit;
+    };
+    std::vector<SurfacePatchFit> ordered = seeds;
+    std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+        return a.residuals.area > b.residuals.area;
+    });
+    std::vector<SurfacePatchFit> models;
+    for (const auto& seed : ordered) {
+        if (!seed.accepted) continue;
+        bool combined = false;
+        for (auto& model : models) {
+            if (model.kind != seed.kind) continue;
+            Candidate candidate;
+            candidate.kind = model.kind;
+            candidate.parameters = model.parameters;
+            double supportedArea = 0.0;
+            for (const auto triangle : seed.triangleIndices) {
+                if (triangleFitsCandidate(mesh, triangle, candidate, options.positionTolerance * 2.0,
+                                          options.normalToleranceRadians,
+                                          options.smoothNormalToleranceRadians * options.hypothesisInlierToleranceFactor)) supportedArea += mesh.features[triangle].area;
+            }
+            if (supportedArea < seed.residuals.area * options.minimumInlierAreaFraction) continue;
+            auto triangles = model.triangleIndices;
+            triangles.insert(triangles.end(), seed.triangleIndices.begin(), seed.triangleIndices.end());
+            auto fit = fitSurfacePatch(mesh, triangles, familyOptions(model.kind));
+            if (!fit.accepted) continue;
+            model = std::move(fit);
+            combined = true;
+            break;
+        }
+        if (!combined) models.push_back(seed);
+    }
+    if (models.empty()) return seeds;
+    const std::size_t count = mesh.triangles.size();
+    std::vector<bool> included(count, false);
+    for (const auto& seed : seeds) for (const auto triangle : seed.triangleIndices) included[triangle] = true;
+    std::vector<double> costs(count * models.size(), std::numeric_limits<double>::infinity());
+    std::vector<int> labels(count, -1);
+    for (std::size_t triangle = 0; triangle < count; ++triangle) {
+        if (!included[triangle]) continue;
+        double best = std::numeric_limits<double>::infinity();
+        for (std::size_t modelIndex = 0; modelIndex < models.size(); ++modelIndex) {
+            const auto& fit = models[modelIndex];
+            Candidate model;
+            model.kind = fit.kind;
+            model.parameters = fit.parameters;
+            double squares = 0.0, maximum = 0.0;
+            for (const auto vertex : mesh.triangles[triangle].vertices) {
+                const double error = std::abs(candidatePositionResidual(model, mesh.vertices[vertex]));
+                squares += error * error;
+                maximum = std::max(maximum, error);
+            }
+            if (maximum > options.positionTolerance * 2.0) continue;
+            const Vec3d expected = normalized(candidateNormal(model, mesh.features[triangle].centroid));
+            double angle = std::acos(clampUnit(std::abs(dot(expected, mesh.features[triangle].normal))));
+            double observationTolerance = options.normalToleranceRadians;
+            if (mesh.cornerNormals.size() == count) {
+                const auto& normals = mesh.cornerNormals[triangle];
+                double normalSquares = 0.0;
+                unsigned normalCount = 0;
+                for (std::size_t corner = 0; corner < 3; ++corner) {
+                    const Vec3d observed = normalized(normals[corner]);
+                    if (norm(observed) == 0.0) continue;
+                    const Vec3d predicted = normalized(candidateNormal(model,
+                        mesh.vertices[mesh.triangles[triangle][corner]]));
+                    const double error = std::acos(clampUnit(std::abs(dot(observed, predicted))));
+                    normalSquares += error * error;
+                    ++normalCount;
+                }
+                if (normalCount == 3) {
+                    angle = std::sqrt(normalSquares / normalCount);
+                    observationTolerance = options.smoothNormalToleranceRadians;
+                }
+            }
+            // Triangle counts overstate evidence on tessellator slivers. Charge
+            // model complexity per physical support area at the fit resolution.
+            const double complexity = options.complexityPenaltyWeight *
+                static_cast<double>(parameterCount(fit.kind)) * options.positionTolerance *
+                mesh.bounds.diagonal() / std::max(fit.residuals.area, options.positionTolerance * options.positionTolerance);
+            const double value = (squares / 3.0 + maximum * maximum) * 0.5 /
+                (options.positionTolerance * options.positionTolerance) + complexity +
+                options.normalScoreWeight * std::min(4.0, angle * angle /
+                    (observationTolerance * observationTolerance));
+            costs[triangle * models.size() + modelIndex] = value;
+            if (value < best) { best = value; labels[triangle] = static_cast<int>(modelIndex); }
+        }
+    }
+    // Model selection chooses the supported hypotheses. Boundary placement
+    // then minimizes geometric error without repeatedly charging activation
+    // cost to each triangle (which would bias a tangent seam toward large faces).
+    std::vector<bool> active(models.size(), false);
+    for (const auto label : labels) if (label >= 0) active[label] = true;
+    double meanArea = 0.0;
+    std::size_t includedCount = 0;
+    for (std::size_t triangle = 0; triangle < count; ++triangle) {
+        if (included[triangle]) { meanArea += mesh.features[triangle].area; ++includedCount; }
+    }
+    meanArea /= static_cast<double>(std::max<std::size_t>(1, includedCount));
+    const double edgeScale = std::sqrt(meanArea);
+    for (std::size_t model = 0; model < models.size(); ++model) {
+        const double complexity = options.complexityPenaltyWeight *
+            static_cast<double>(parameterCount(models[model].kind)) * options.positionTolerance *
+            mesh.bounds.diagonal() / std::max(models[model].residuals.area, options.positionTolerance * options.positionTolerance);
+        for (std::size_t triangle = 0; triangle < count; ++triangle) {
+            auto& cost = costs[triangle * models.size() + model];
+            cost = active[model] ? std::max(0.0, cost - complexity) * mesh.features[triangle].area / meanArea
+                                 : std::numeric_limits<double>::infinity();
+        }
+    }
+    std::vector<PottsEdge> edges;
+    for (std::size_t triangle = 0; triangle < count; ++triangle) {
+        if (!included[triangle]) continue;
+        for (const auto neighbor : mesh.triangleNeighbors[triangle]) {
+            if (neighbor <= triangle || !included[neighbor]) continue;
+            std::array<std::uint32_t, 2> shared{};
+            unsigned found = 0;
+            for (const auto a : mesh.triangles[triangle].vertices) {
+                for (const auto b : mesh.triangles[neighbor].vertices) {
+                    if (a == b && found < 2) shared[found++] = a;
+                }
+            }
+            if (found == 2) edges.push_back({triangle, neighbor,
+                options.boundaryRegularizationWeight *
+                norm(mesh.vertices[shared[0]] - mesh.vertices[shared[1]]) / edgeScale});
+        }
+    }
+    labels = minimizePottsEnergy(costs, models.size(), edges, labels);
+    std::vector<std::vector<std::uint32_t>> groups(models.size() + 1);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!included[i]) continue;
+        groups[labels[i] < 0 ? models.size() : static_cast<std::size_t>(labels[i])].push_back(static_cast<std::uint32_t>(i));
+    }
+    std::vector<SurfacePatchFit> result;
+    for (std::size_t group = 0; group < groups.size(); ++group) {
+        for (const auto& component : connectedComponents(mesh, groups[group])) {
+            if (group < models.size()) {
+                result.push_back(fitSurfacePatch(mesh, component, familyOptions(models[group].kind)));
+            } else {
+                auto fitted = fitAndSplitRegion(mesh, component, options);
+                result.insert(result.end(), std::make_move_iterator(fitted.begin()), std::make_move_iterator(fitted.end()));
+            }
+        }
+    }
+    return result;
+}
+
 } // namespace
 
 const char* toString(SurfaceKind kind) noexcept {
@@ -1256,6 +1658,7 @@ const char* toString(SurfaceKind kind) noexcept {
     case SurfaceKind::Unknown: return "unknown";
     case SurfaceKind::Plane: return "plane";
     case SurfaceKind::Cylinder: return "cylinder";
+    case SurfaceKind::Cone: return "cone";
     case SurfaceKind::Sphere: return "sphere";
     case SurfaceKind::Torus: return "torus";
     case SurfaceKind::BSpline: return "bspline";
@@ -1299,7 +1702,15 @@ SurfacePatchFit fitSurfacePatch(
         if (best == nullptr || candidate.score < best->score) best = &candidate;
     }
     if (best == nullptr) {
-        result.diagnostic = "No analytic surface model passed the scale-relative tolerances";
+        std::ostringstream reason;
+        reason << "No analytic surface passed tolerance " << positionTolerance;
+        for (const auto& candidate : candidates) {
+            reason << "; " << toString(candidate.kind) << " rms=" << candidate.residuals.positionRms
+                   << " max=" << candidate.residuals.positionMax
+                   << " normal=" << candidate.residuals.normalRmsRadians
+                   << " inlier=" << candidate.residuals.inlierAreaFraction;
+        }
+        result.diagnostic = reason.str();
         return result;
     }
     result.kind = best->kind;
@@ -1316,13 +1727,91 @@ std::vector<SurfacePatchFit> fitSurfacePatches(
     const std::vector<std::vector<std::uint32_t>>& regions,
     const SurfaceFitOptions& options) {
     validateOptions(options);
+    SurfaceFitOptions resolvedOptions = options;
+    resolvedOptions.positionTolerance = derivedPositionTolerance(mesh, options);
     std::vector<SurfacePatchFit> result;
-    for (const std::vector<std::uint32_t>& region : regions) {
-        std::vector<SurfacePatchFit> fitted = fitAndSplitRegion(mesh, region, options);
-        result.insert(result.end(),
-                      std::make_move_iterator(fitted.begin()),
-                      std::make_move_iterator(fitted.end()));
+    if (options.respectSourcePatchBoundaries) {
+        for (const auto& region : regions) {
+            auto fitted = fitAndSplitRegion(mesh, region, resolvedOptions);
+            result.insert(result.end(), std::make_move_iterator(fitted.begin()),
+                          std::make_move_iterator(fitted.end()));
+        }
+        return result;
     }
+    // CUDA regions are seeds, not immutable face boundaries. Grow accepted
+    // models through adjacent inliers before fitting smaller, noisy fragments.
+    // This is deterministic model-based region growing with a bounded refit.
+    std::vector<unsigned char> remaining(mesh.triangles.size(), 0);
+    std::vector<std::size_t> order(regions.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::vector<double> areas(regions.size(), 0.0);
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+        for (const auto triangle : regions[i]) {
+            if (triangle >= remaining.size() || remaining[triangle]) throw std::invalid_argument("Overlapping or invalid seed regions");
+            remaining[triangle] = 1;
+            areas[i] += mesh.features[triangle].area;
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return areas[a] > areas[b]; });
+    const auto grow = [&](SurfacePatchFit fit) {
+        Candidate model;
+        model.kind = fit.kind;
+        model.parameters = fit.parameters;
+        std::vector<unsigned char> visited(mesh.triangles.size(), 0);
+        auto queue = fit.triangleIndices;
+        for (const auto triangle : queue) visited[triangle] = 1;
+        for (std::size_t head = 0; head < queue.size(); ++head) {
+            for (const auto neighbor : mesh.triangleNeighbors[queue[head]]) {
+                if (!remaining[neighbor] || visited[neighbor]) continue;
+                visited[neighbor] = 1;
+                if (triangleFitsCandidate(mesh, neighbor, model,
+                    resolvedOptions.positionTolerance * options.hypothesisInlierToleranceFactor,
+                    options.normalToleranceRadians * options.hypothesisInlierToleranceFactor,
+                    options.smoothNormalToleranceRadians * options.hypothesisInlierToleranceFactor)) queue.push_back(neighbor);
+            }
+        }
+        if (queue.size() > fit.triangleIndices.size()) {
+            std::sort(queue.begin(), queue.end());
+            const auto refined = fitSurfacePatch(mesh, queue, resolvedOptions);
+            if (refined.accepted) fit = refined;
+        }
+        for (const auto triangle : fit.triangleIndices) remaining[triangle] = 0;
+        result.push_back(std::move(fit));
+    };
+    for (const auto index : order) {
+        // A seed smaller than the spatial noise footprint cannot establish a
+        // separate surface reliably. Keep its triangles for joint assignment;
+        // any region unexplained by existing models is fitted afterwards.
+        if (areas[index] < kPi * resolvedOptions.positionTolerance * resolvedOptions.positionTolerance) continue;
+        std::vector<std::uint32_t> seed;
+        for (const auto triangle : regions[index]) if (remaining[triangle]) seed.push_back(triangle);
+        if (seed.size() < options.minimumTriangleCount) continue;
+        for (auto component : connectedComponents(mesh, seed)) {
+            std::erase_if(component, [&](auto triangle) { return !remaining[triangle]; });
+            if (component.empty()) continue;
+            auto fit = fitSurfacePatch(mesh, component, resolvedOptions);
+            if (fit.accepted) grow(std::move(fit));
+        }
+    }
+    std::vector<std::uint32_t> unresolved;
+    for (std::size_t i = 0; i < remaining.size(); ++i) if (remaining[i]) unresolved.push_back(static_cast<std::uint32_t>(i));
+    const bool hasHypotheses = !result.empty();
+    for (const auto& component : connectedComponents(mesh, unresolved)) {
+        if (!hasHypotheses) {
+            auto fitted = fitAndSplitRegion(mesh, component, resolvedOptions);
+            result.insert(result.end(), std::make_move_iterator(fitted.begin()), std::make_move_iterator(fitted.end()));
+        } else {
+            // Joint assignment must see the established hypotheses before
+            // tiny residual fragments generate poorly constrained new models.
+            SurfacePatchFit pending;
+            pending.triangleIndices = component;
+            for (const auto triangle : component) pending.residuals.area += mesh.features[triangle].area;
+            pending.diagnostic = "Awaiting joint surface assignment";
+            result.push_back(std::move(pending));
+        }
+    }
+    result = refineSurfaceLabels(mesh, result, resolvedOptions);
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.triangleIndices.front() < b.triangleIndices.front(); });
     return result;
 }
 

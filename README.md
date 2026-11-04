@@ -1,26 +1,33 @@
 # reCAD: GLB to analytic CAD with CUDA segmentation
 
 Native C++20/CUDA/OpenCascade reconstruction from tessellated GLB input. The
-production path fits connected surface patches rather than assuming a particular
+experimental reconstruction path fits connected surface patches rather than assuming a particular
 box/sphere Boolean expression. No filenames, reference dimensions, or CSG trees
 are used to reconstruct geometry.
 
 ## Pipeline
 
-1. Decode the GLB scene, apply transforms, convert units, weld positions, and
-   repair winding. Preserve raw shared-index components before welding: CAD
+1. Decode the GLB scene, including Draco compression, apply transforms to positions
+   and normals, convert units, weld positions, conform T-junctions, and repair
+   winding. Preserve raw shared-index components before welding: CAD
    exporters often duplicate vertices at original face boundaries.
 2. Compute triangle features and classify adjacent triangle pairs on CUDA.
-   Classifications use dihedral angle, optional geometric guards, and source
+   Classifications use dihedral angle, smooth-normal curvature, geometric guards, and source
    boundaries when useful. Deterministic CPU union-find assembles the GPU merge
    decisions into regions. Triangle soups with one source component per triangle
    automatically use geometric segmentation instead of that uninformative prior.
-3. Fit plane, cylinder, sphere, and ring-torus candidates to each region using
+3. Fit plane, cylinder, cone, sphere, and ring-torus candidates to each region using
    area-weighted least squares, robust Huber/LM refinement, positional and normal
    consistency, and a BIC-style model-complexity penalty. PCA, normal directions,
    shared planar directions, and spherical direction sampling initialize axes.
    Fixed-axis torus refinement precedes full refinement. Unresolved mixed regions
    can be split by deterministic local hypotheses and connected inliers.
+   Model-based growth and label refinement join fragmented seeds; physical
+   support area prevents tessellation slivers from dominating model selection.
+   Area-weighted metric Potts alpha expansion jointly assigns triangles to
+   fitted surfaces, with a boundary-length penalty. Seeds smaller than the
+   spatial noise footprint are deferred to joint assignment; unexplained regions
+   are fitted afterward. The solver uses iterative push/relabel, without recursion.
 4. Recover oriented boundary loops and holes; project and unwrap them in fitted
    surface coordinates. OpenCascade builds trimmed analytic faces, sews them with
    a fit/chord-aware tolerance, heals shells, and orients closed solids.
@@ -28,16 +35,16 @@ are used to reconstruct geometry.
    `GeomPlate_BuildPlateSurface` with boundary curves and scattered interior
    constraints, then `GeomPlate_MakeApprox` to obtain a smooth B-spline surface.
    Check all source vertices, including those omitted from the fitting system.
-   Folded or failed charts retain trimmed degree-one B-spline triangle faces.
-   If the combined result cannot form a valid solid, the complete triangle
-   B-spline fallback preserves the mesh geometry.
+   Failed fitting, trimming, or solid assembly terminates reconstruction with
+   an explicit error. There is no triangle-face substitute.
 6. Validate topology and bidirectional mesh/BRep distance, then write STEP/BREP.
    Only after export can an optional STEP reference be loaded for independent
    topology, mass-property, bounds, and sampled boundary-distance comparison.
 
 The NURBS path uses [OpenCascade's plate fitting and approximation APIs](https://dev.opencascade.org/doc/refman/html/package_geomplate.html).
-The final triangle fallback is a faithful mesh representation, not a claim that
-the original smooth CAD surface has been recovered.
+Fitting, label refinement, and OpenCascade construction run on the CPU. CUDA
+accelerates initial triangle features, curvature, and adjacency classification.
+Graph optimization follows [Boykov, Veksler, and Zabih (PAMI 2001)](https://www.cs.cornell.edu/rdz/Papers/BVZ-pami01-final.pdf).
 
 ## Accuracy contract
 
@@ -46,32 +53,45 @@ vertices. Original trimming curves, manufacturing dimensions, and feature histor
 cannot be guaranteed from a finite tessellation. Surface recognition coverage is
 not a geometric accuracy percentage.
 
-Every run writes `reconstruction.json`, `report.txt`, `segmentation.ply`,
-`reconstructed.brep`, and `reconstructed.step`. Reports distinguish analytic,
-smooth NURBS, and triangle-fallback output and record residuals and CUDA timings.
+Successful runs write `reconstruction.json`, `report.txt`, `segmentation.ply`,
+`reconstructed.brep`, and `reconstructed.step`. Reports distinguish analytic and
+smooth NURBS output and record residuals and CUDA timings. `surface_fitting.json`
+is available even when solid construction fails. Check `run_status.json` when
+reusing an output directory: older exports may remain after a failed run.
 
-The five `basic_geometry` GLB/STEP pairs were tested locally with CUDA 13.2,
-OpenCascade 8.0.0, and an RTX 5060. Every sample produced one valid closed solid,
-100% analytic patch coverage, and the same face-type counts as its BRep reference:
+The five `glb-smooth` GLB/STEP CSG pairs were verified on 2026-11-04 with
+CUDA 13.2, OpenCascade 8.0.0, and an RTX 5060. Every output is one valid closed
+solid with analytic surfaces and zero B-spline faces. No reference geometry is
+available to the fitting or construction stages.
 
-| Sample | Planes | Cylinders | Spheres | Tori | Surface RMS (mm) | Sampled maximum incl. edges (mm) |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| box/profile double cut | 21 | 24 | 0 | 0 | 0.0000631 | 0.01770 |
-| box/sphere | 6 | 0 | 1 | 0 | 0.00000091 | 0.00089 |
-| hollow extrusion | 9 | 9 | 0 | 0 | 0.0003572 | 0.02087 |
-| curved hollow extrusion | 5 | 5 | 0 | 8 | 0.0000448 | 0.02251 |
-| curved extrusion/sphere | 6 | 4 | 1 | 8 | 0.0004196 | 0.09438 |
+| Sample | Analytic faces | Reference RMS (mm) | Sampled maximum (mm) | Volume error (%) | CPU fitting (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CSG intersection/subtraction | 18 | 0.003000 | 0.083159 | 0.118577 | 3.428 |
+| Plate with holes | 11 | 0.001204 | 0.009414 | 0.024092 | 0.033 |
+| Bracket with fillet | 9 | 0.000465 | 0.003005 | 0.003255 | 0.001 |
+| Rounded box | 26 | 0.002609 | 0.045201 | 0.165818 | 4.581 |
+| Pulley with groove | 7 | 0.001332 | 0.010052 | 0.020843 | 0.135 |
 
-These are sampled bidirectional distances to the reference STEP boundary, not
-certified Hausdorff bounds. Sampling uses up to 512 area-stratified surface
-points plus 512 edge/vertex points per direction. Surface RMS is area weighted;
-edge samples contribute to the maximum. Face counts match, but fragmented trim
-edges mean full topological entity counts need not match. Relative volume error
-across these samples was at most 0.032%.
+The rounded box contains six planes, twelve cylinders, and eight spheres. The
+CSG sample's spherical surface uses multiple parameter charts; face and edge
+counts can differ from the reference even when the geometry is close.
 
-The STEP CSG files describe the expected primitive families and were inspected
-for test coverage. Neither STEP nor STEP CSG geometry enters fitting, trimming,
-or reconstruction selection.
+The accepted validation run uses an explicit volume-error limit of **0.166%**,
+surface RMS at most **0.005 mm**, maximum sampled distance at most **0.1 mm**,
+and the runner's additional relative-distance limits. Sampling uses up to 2,048
+area-stratified surface points plus 2,048 boundary points per direction. RMS is
+area weighted; edge samples contribute to the maximum. OCCT mass properties
+use adaptive integration. These measurements are not certified Hausdorff bounds.
+Fitting times exclude construction, export, and independent reference validation.
+
+Detailed local reports are in `output/validated-glb-smooth`. The bundled original
+GLB also passes `--verify-analytic`. The older `basic_geometry` dataset was
+unavailable for this regression run. This five-sample result does not establish
+reliability on hundreds of unseen models.
+
+STEP CSG references are evaluated independently using OCCT primitive and Boolean
+builders. Neither STEP nor STEP CSG geometry enters fitting, trimming, or
+reconstruction selection.
 
 ## Units and coordinates
 
@@ -97,7 +117,7 @@ files stay under `build/native/obj`. The solution and projects live in the sourc
 repository, so Visual Studio uses the root Git repository.
 
 Install the VS 2026 Desktop development with C++ workload and CUDA 13.2 with
-Visual Studio integration. Eigen3, nlohmann/json, tinygltf, and OpenCascade
+Visual Studio integration. Eigen3, nlohmann/json, tinygltf, Draco, and OpenCascade
 dependencies live under `.deps`. For a fresh checkout, run
 `scripts/bootstrap-dependencies.ps1` once, or let the build helper install missing
 dependencies.
@@ -110,8 +130,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-vs2026.ps1 -Configurati
 ```
 
 Use `--help` for options, including `--fit-tolerance`, `--smooth-angle`,
-`--ignore-source-patches`, `--force-nurbs`, and `--verify-analytic`.
-`--force-nurbs` explicitly chooses the triangle-preserving fallback.
+`--ignore-source-patches`, and `--verify-analytic`.
 The native projects target CUDA architecture 120. Override the
 `RecadCudaArchitecture` MSBuild property for another GPU, for example
 `/p:RecadCudaArchitecture=89`. Shared compiler, linker, and runtime settings live
@@ -127,8 +146,11 @@ To compare a reconstructed model against a Z-up STEP reference:
 
 `--verify` checks solid validity and scale-relative mesh fidelity. When a
 reference is supplied, it also requires comparison to complete without failed
-samples. The dataset runner additionally checks surface signatures and reference
-distance limits; reference geometry never determines the reconstructed result.
+samples. The dataset runner additionally checks reference distance and volume
+limits; `-RequireSurfaceSignature` also requires matching surface-type counts.
+Reference geometry never determines the reconstructed result. Use
+`--reference-samples 2048` (or `-ReferenceSamples 2048` in the runner) for denser
+sampling. Sampled errors are not certified Hausdorff bounds.
 
 ## Tests
 
@@ -136,13 +158,24 @@ distance limits; reference geometry never determines the reconstructed result.
 powershell -ExecutionPolicy Bypass -File .\tests\run-integration.ps1 -Configuration Release
 
 powershell -ExecutionPolicy Bypass -File .\tests\run-samples.ps1 `
-  -DatasetRoot C:\Users\YuriyV\Downloads\basic_geometry `
-  -OutputRoot .\output\basic_geometry
+  -DatasetRoot C:\Users\YuriyV\Downloads\glb-smooth `
+  -OutputRoot .\output\validated-glb-smooth `
+  -ReferenceSamples 2048 -MaximumRelativeVolumeError 0.00166
 ```
 
+The dataset runner discovers GLBs recursively and matches STEP reference stems,
+including exporter suffixes. Use `-ReferenceRoot` to resolve ambiguous references.
+It continues after failures, saves metrics after each file, and enforces
+`-TimeoutSeconds` (default 300). `-ReuseCompleted` rechecks fresh completed reports
+without rerunning reconstruction; `Reused` identifies those rows and `Seconds`
+measures the current runner invocation. Limits and paths are saved in
+`validation_settings.json`.
+
 The native test runner covers CUDA merge/split decisions, source boundaries, deterministic labels,
-invalid adjacency, rotated cylinder/torus fitting, a smooth free-form NURBS patch
-inside a closed solid, triangle-preserving fallback, known reference distances,
+exact graph-cut checks against exhaustive search and dynamic programming,
+invalid adjacency, rotated cylinder/torus fitting, rotated and scaled cones,
+a smooth free-form NURBS patch inside a closed solid, explicit reconstruction
+failure, known reference distances, trimmed periodic surface sampling,
 and the original GLB fixture. The dataset runner requires every sample to be
 fully analytic, closed, valid, and within its reference tolerances.
 
@@ -154,12 +187,12 @@ fully analytic, closed, valid, and within its reference tolerances.
 | `src/CudaGeometry.cu` | GPU features, adjacency classification, residual kernels |
 | `src/SurfaceFitting.cpp` | Robust primitive fitting and model selection |
 | `src/PatchReconstruction.cpp` | Analytic trimming, smooth NURBS fitting, sewing |
-| `src/GeneralReconstruction.cpp` | Mesh-preserving B-spline fallback |
 | `src/ReferenceValidation.cpp` | Independent post-export STEP comparison |
 | `src/Distance.cpp` | Mesh/BRep distance and mesh BVH |
 | `src/main.cpp` | CLI, orchestration, reports, validation/export |
 
-Remaining limits include unsupported analytic families such as cones, unproven
-robustness on noisy scans or folded free-form charts, approximate trim curves,
-and no recovery of an original CSG construction history. Unsupported surfaces
-use the NURBS/fallback path instead of being forced into a known primitive.
+Remaining limits include unproven robustness on noisy scans or folded free-form
+charts, approximate trim curves, and no recovery of an original CSG construction
+history. An unsupported primitive requires a validated fitted NURBS surface;
+otherwise reconstruction fails. Dataset results do not establish reliability
+on arbitrary unseen GLBs.

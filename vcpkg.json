@@ -3,6 +3,7 @@
   "name": "recad-mesh2brep",
   "version-string": "0.1.0",
   "dependencies": [
+    "draco",
     "eigen3",
     "nlohmann-json",
     "opencascade",

@@ -282,6 +282,24 @@ void testAsymmetricAdjacencyIsRejected() {
     require(rejected, "asymmetric adjacency must throw std::invalid_argument");
 }
 
+void testSmoothCurvatureBoundary() {
+    Mesh mesh = twoCoplanarTriangles();
+    for (const auto& point : mesh.vertices) mesh.bounds.expand(point);
+    mesh.cornerNormals.resize(2);
+    for (auto& normals : mesh.cornerNormals) normals.fill({0.0, 0.0, 1.0});
+    // Normals agree on the shared tangent edge. Only the second patch bends
+    // away from that edge; its average normal is still within the angle guard.
+    mesh.cornerNormals[1][2] = recad::normalized(Vec3d{-0.05, 0.05, 1.0});
+    CudaTriangleSegmentationOptions options;
+    options.maximumDihedralAngleRadians = 10.0 * kPi / 180.0;
+    options.maximumRelativeCurvatureDifference = 0.0;
+    const auto angleOnly = recad::segmentTriangleRegionsCuda(mesh, options);
+    require(angleOnly.regions.size() == 1U, "Tangent patches pass the angle-only guard");
+    options.maximumRelativeCurvatureDifference = 0.35;
+    const auto curvature = recad::segmentTriangleRegionsCuda(mesh, options);
+    require(curvature.regions.size() == 2U, "CUDA curvature must separate distinct tangent surfaces");
+}
+
 } // namespace
 
 int runCudaSegmentationTests() {
@@ -292,6 +310,7 @@ int runCudaSegmentationTests() {
         testSmoothCylinderLikeStripMerges();
         testLabelsAreDeterministic();
         testAsymmetricAdjacencyIsRejected();
+        testSmoothCurvatureBoundary();
         std::cout << "CUDA triangle segmentation tests passed\n";
         return 0;
     } catch (const std::exception& exception) {

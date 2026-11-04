@@ -57,6 +57,14 @@ struct DeviceTriangleFeature {
     double planeOffset;
     double maxEdgeLength;
     int degenerate;
+    double curvatureLow{};
+    double curvatureHigh{};
+    int hasCurvature{};
+};
+
+struct DeviceSmoothTriangle {
+    DeviceVec3 positions[3];
+    DeviceVec3 normals[3];
 };
 
 struct DeviceAdjacencyPair {
@@ -327,6 +335,54 @@ __global__ void triangleFeatureKernel(const DeviceVec3* vertices,
     }
 }
 
+// Least-squares Weingarten map: dN = S dP in the tangent plane. Its eigenvalues
+// distinguish curvature discontinuities even when adjacent faces are tangent.
+__global__ void smoothCurvatureKernel(const DeviceSmoothTriangle* triangles,
+                                      std::size_t count, DeviceTriangleFeature* features) {
+    const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += stride) {
+        const auto triangle = triangles[i];
+        if (vectorLength(triangle.normals[0]) < 0.5 || vectorLength(triangle.normals[1]) < 0.5 ||
+            vectorLength(triangle.normals[2]) < 0.5) continue;
+        DeviceVec3 n{triangle.normals[0].x + triangle.normals[1].x + triangle.normals[2].x,
+                     triangle.normals[0].y + triangle.normals[1].y + triangle.normals[2].y,
+                     triangle.normals[0].z + triangle.normals[1].z + triangle.normals[2].z};
+        const double length = vectorLength(n);
+        if (length < 0.5) continue;
+        n = {n.x / length, n.y / length, n.z / length};
+        features[i].normal = n;
+        const DeviceVec3 seed = fabs(n.x) < 0.8 ? DeviceVec3{1, 0, 0} : DeviceVec3{0, 1, 0};
+        DeviceVec3 x = crossProduct(n, seed);
+        const double xLength = vectorLength(x);
+        x = {x.x / xLength, x.y / xLength, x.z / xLength};
+        const DeviceVec3 y = crossProduct(n, x);
+        double a = 0, b = 0, c = 0, nx = 0, ny = 0, mx = 0, my = 0;
+        for (unsigned edge = 0; edge < 3; ++edge) {
+            const auto dp = subtract(triangle.positions[(edge + 1) % 3], triangle.positions[edge]);
+            const auto dn = subtract(triangle.normals[(edge + 1) % 3], triangle.normals[edge]);
+            const double u = dotProduct(dp, x), v = dotProduct(dp, y);
+            const double du = dotProduct(dn, x), dv = dotProduct(dn, y);
+            a += u * u; b += u * v; c += v * v;
+            nx += du * u; ny += du * v; mx += dv * u; my += dv * v;
+        }
+        const double trace = a + c;
+        if (!(trace > 0.0) || a * c - b * b <= trace * trace * 1.0e-12) continue;
+        a += trace * 1.0e-10;
+        c += trace * 1.0e-10;
+        const double determinant = a * c - b * b;
+        const double s00 = (nx * c - ny * b) / determinant;
+        const double s11 = (my * a - mx * b) / determinant;
+        const double s01 = ((ny * a - nx * b) + (mx * c - my * b)) / (2.0 * determinant);
+        const double radius = hypot(0.5 * (s00 - s11), s01);
+        const double k0 = fabs(0.5 * (s00 + s11) - radius);
+        const double k1 = fabs(0.5 * (s00 + s11) + radius);
+        features[i].curvatureLow = fmin(k0, k1);
+        features[i].curvatureHigh = fmax(k0, k1);
+        features[i].hasCurvature = isfinite(k0) && isfinite(k1);
+    }
+}
+
 __global__ void triangleAdjacencyMergeKernel(
     const DeviceTriangleFeature* features,
     const DeviceAdjacencyPair* adjacencyPairs,
@@ -335,6 +391,8 @@ __global__ void triangleAdjacencyMergeKernel(
     double maximumCentroidDistance,
     double maximumCentroidDistanceToEdgeRatio,
     bool treatOppositeNormalsAsAligned,
+    double relativeCurvatureTolerance,
+    double absoluteCurvatureTolerance,
     std::uint8_t* mergeMask) {
     const std::size_t stride = static_cast<std::size_t>(blockDim.x) * gridDim.x;
     for (std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -360,6 +418,12 @@ __global__ void triangleAdjacencyMergeKernel(
             }
         }
 
+        if (merge && relativeCurvatureTolerance > 0.0 && first.hasCurvature && second.hasCurvature) {
+            const double limit = absoluteCurvatureTolerance + relativeCurvatureTolerance *
+                fmax(first.curvatureHigh, second.curvatureHigh);
+            merge = fabs(first.curvatureLow - second.curvatureLow) <= limit &&
+                    fabs(first.curvatureHigh - second.curvatureHigh) <= limit;
+        }
         if (merge && (maximumCentroidDistance > 0.0 ||
                       maximumCentroidDistanceToEdgeRatio > 0.0)) {
             const double centroidDistance = vectorLength(
@@ -776,6 +840,18 @@ CudaTriangleSegmentationResult segmentTriangleRegionsCuda(
     }
 
     const std::size_t triangleCount = mesh.triangles.size();
+    if (!std::isfinite(options.maximumRelativeCurvatureDifference) ||
+        options.maximumRelativeCurvatureDifference < 0.0) {
+        throw std::invalid_argument("Relative curvature difference must be finite and non-negative");
+    }
+    if (!mesh.cornerNormals.empty() && mesh.cornerNormals.size() != triangleCount) {
+        throw std::invalid_argument("Corner normals must contain one triplet per triangle");
+    }
+    for (const auto& normals : mesh.cornerNormals) {
+        for (const auto& normal : normals) {
+            if (!finite(normal)) throw std::invalid_argument("Corner normals must be finite");
+        }
+    }
     if (triangleCount > static_cast<std::size_t>(
                             std::numeric_limits<std::int32_t>::max())) {
         throw std::length_error("Triangle count exceeds the supported label range");
@@ -934,6 +1010,19 @@ CudaTriangleSegmentationResult segmentTriangleRegionsCuda(
         }
 
         DeviceBuffer<DeviceTriangleFeature> deviceFeatures(triangleCount);
+        std::vector<DeviceSmoothTriangle> smoothTriangles;
+        if (mesh.cornerNormals.size() == triangleCount) {
+            smoothTriangles.resize(triangleCount);
+            for (std::size_t i = 0; i < triangleCount; ++i) {
+                for (unsigned corner = 0; corner < 3; ++corner) {
+                    const auto& p = mesh.vertices[mesh.triangles[i][corner]];
+                    const auto& n = mesh.cornerNormals[i][corner];
+                    smoothTriangles[i].positions[corner] = {p.x, p.y, p.z};
+                    smoothTriangles[i].normals[corner] = {n.x, n.y, n.z};
+                }
+            }
+        }
+        DeviceBuffer<DeviceSmoothTriangle> deviceSmoothTriangles(smoothTriangles.size());
         DeviceBuffer<DeviceAdjacencyPair> deviceAdjacencyPairs(adjacencyPairs.size());
         DeviceBuffer<std::uint8_t> deviceMergeMask(adjacencyPairs.size());
         CudaStream stream;
@@ -953,8 +1042,16 @@ CudaTriangleSegmentationResult segmentTriangleRegionsCuda(
                                          adjacencyPairs.size() * sizeof(DeviceAdjacencyPair),
                                          cudaMemcpyHostToDevice,
                                          stream.get()));
+        if (!smoothTriangles.empty()) {
+            RECAD_CUDA_CHECK(cudaMemcpyAsync(deviceSmoothTriangles.get(), smoothTriangles.data(),
+                smoothTriangles.size() * sizeof(DeviceSmoothTriangle), cudaMemcpyHostToDevice, stream.get()));
+        }
         uploaded.record(stream.get());
-
+        if (!smoothTriangles.empty()) {
+            smoothCurvatureKernel<<<launchBlockCount(triangleCount, selected.properties), kThreadsPerBlock, 0, stream.get()>>>(
+                deviceSmoothTriangles.get(), triangleCount, deviceFeatures.get());
+            RECAD_CUDA_CHECK(cudaGetLastError());
+        }
         const int blocks = launchBlockCount(adjacencyPairs.size(), selected.properties);
         triangleAdjacencyMergeKernel<<<blocks, kThreadsPerBlock, 0, stream.get()>>>(
             deviceFeatures.get(),
@@ -964,6 +1061,8 @@ CudaTriangleSegmentationResult segmentTriangleRegionsCuda(
             options.maximumCentroidDistance,
             options.maximumCentroidDistanceToEdgeRatio,
             options.treatOppositeNormalsAsAligned,
+            hasSourcePatches ? 0.0 : options.maximumRelativeCurvatureDifference,
+            1.0e-4 / std::max(mesh.bounds.diagonal(), 1.0e-12),
             deviceMergeMask.get());
         RECAD_CUDA_CHECK(cudaGetLastError());
         kernelFinished.record(stream.get());

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(CudaToolkitCustomDir)extras\visual_studio_integration\MSBuildExtensions\CUDA 13.2.targets" />
+  </ImportGroup>
+  <Target Name="CopyRecadRuntimeDependencies" AfterTargets="Build">
+    <Copy SourceFiles="@(RecadRuntimeDll)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

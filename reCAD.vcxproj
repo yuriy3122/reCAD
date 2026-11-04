@@ -22,8 +22,8 @@
     <ClCompile Include="src\Distance.cpp" />
     <ClCompile Include="src\CadReconstruction.cpp" />
     <ClCompile Include="src\SurfaceFitting.cpp" />
+    <ClCompile Include="src\GraphCut.cpp" />
     <ClCompile Include="src\PatchReconstruction.cpp" />
-    <ClCompile Include="src\GeneralReconstruction.cpp" />
     <ClCompile Include="src\ReferenceValidation.cpp" />
     <CudaCompile Include="src\CudaGeometry.cu" />
   </ItemGroup>
@@ -34,8 +34,8 @@
     <ClInclude Include="include\CudaGeometry.h" />
     <ClInclude Include="include\CadReconstruction.h" />
     <ClInclude Include="include\SurfaceFitting.h" />
+    <ClInclude Include="include\GraphCut.h" />
     <ClInclude Include="include\PatchReconstruction.h" />
-    <ClInclude Include="include\GeneralReconstruction.h" />
     <ClInclude Include="include\ReferenceValidation.h" />
   </ItemGroup>
   <ItemGroup>

@@ -22,6 +22,7 @@ if (-not $msbuild -or -not (Test-Path -LiteralPath $msbuild)) {
 }
 
 if (-not $SkipDependencies -and (
+    -not (Test-Path -LiteralPath (Join-Path $projectRoot '.deps\installed\x64-windows\lib\draco.lib')) -or
     -not (Test-Path -LiteralPath (Join-Path $projectRoot '.deps\installed\x64-windows\lib\TKXSBase.lib')) -or
     -not (Test-Path -LiteralPath (Join-Path $projectRoot '.deps\tinygltf\include\tiny_gltf.h')))) {
     & (Join-Path $PSScriptRoot 'bootstrap-dependencies.ps1')

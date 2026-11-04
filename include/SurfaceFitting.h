@@ -12,13 +12,14 @@
 
 namespace recad {
 
-// BSpline is reserved for the OpenCascade fallback stage. This module returns
+// BSpline is reserved for the OpenCascade free-form fitting stage. This module returns
 // Unknown when no analytic candidate explains a patch within the requested
 // tolerances; the caller can then replace it with a fitted BSpline surface.
 enum class SurfaceKind {
     Unknown,
     Plane,
     Cylinder,
+    Cone,
     Sphere,
     Torus,
     BSpline
@@ -39,6 +40,12 @@ struct SphereSurface {
     double radius{};
 };
 
+struct ConeSurface {
+    Vec3d apex{};
+    Vec3d axisDirection{}; // From the apex into the observed nappe.
+    double semiAngle{}; // Radians, strictly between zero and pi/2.
+};
+
 struct TorusSurface {
     Vec3d center{};
     Vec3d axisDirection{};
@@ -49,6 +56,7 @@ struct TorusSurface {
 using SurfaceParameters = std::variant<std::monostate,
                                        Plane,
                                        CylinderSurface,
+                                       ConeSurface,
                                        SphereSurface,
                                        TorusSurface>;
 
@@ -79,6 +87,8 @@ struct SurfaceFitOptions {
     // Zero derives a tolerance from mesh scale and the weld tolerance.
     double positionTolerance{};
     double normalToleranceRadians{0.17453292519943295}; // 10 degrees.
+    // Smooth exporter normals are point observations, without chordal bias.
+    double smoothNormalToleranceRadians{0.017453292519943295}; // 1 degree.
     double maximumPositionResidualFactor{8.0};
     // Raw RMS guard; isolated facet-normal outliers are handled by support area.
     double maximumNormalResidualRadians{0.4363323129985824}; // 25 degrees.
@@ -96,6 +106,8 @@ struct SurfaceFitOptions {
     // error plus this BIC-style parameter-count penalty. Lower is better.
     double normalScoreWeight{0.25};
     double complexityPenaltyWeight{1.0};
+    // Dimensionless boundary-length cost in the area-weighted Potts energy.
+    double boundaryRegularizationWeight{0.05};
 
     // Partial tori do not always expose their revolution axis through local
     // point/normal covariance. These deterministic hemisphere samples augment
@@ -118,6 +130,7 @@ struct SurfaceFitOptions {
     // surfaces. When enabled, unresolved regions are searched with local,
     // deterministic hypotheses; connected inliers are extracted and refit.
     bool splitMixedRegions{true};
+    bool respectSourcePatchBoundaries{};
     std::size_t maximumExtractedPatchesPerRegion{128};
     std::size_t maximumHypothesisSeeds{64};
     std::size_t hypothesisNeighborhoodTriangles{24};
@@ -126,6 +139,7 @@ struct SurfaceFitOptions {
 
     bool enablePlanes{true};
     bool enableCylinders{true};
+    bool enableCones{true};
     bool enableSpheres{true};
     bool enableTori{true};
 };

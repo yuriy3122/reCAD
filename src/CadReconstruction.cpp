@@ -125,8 +125,8 @@ ShapeProperties inspectShape(const TopoDS_Shape& shape) {
 
     GProp_GProps volumeProperties;
     GProp_GProps surfaceProperties;
-    BRepGProp::VolumeProperties(shape, volumeProperties);
-    BRepGProp::SurfaceProperties(shape, surfaceProperties);
+    BRepGProp::VolumeProperties(shape, volumeProperties, 1.0e-9);
+    BRepGProp::SurfaceProperties(shape, surfaceProperties, 1.0e-9);
     result.volume = volumeProperties.Mass();
     result.surfaceArea = surfaceProperties.Mass();
     result.bounds = brepBounds(shape);

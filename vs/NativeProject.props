@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals">
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+    <CudaToolkitCustomDir Condition="'$(CudaToolkitCustomDir)' == '' and '$(CUDA_PATH)' != ''">$(CUDA_PATH)\</CudaToolkitCustomDir>
+    <CudaToolkitCustomDir Condition="'$(CudaToolkitCustomDir)' == ''">C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\</CudaToolkitCustomDir>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)' == 'Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)' == 'Release'">false</UseDebugLibraries>
+    <WholeProgramOptimization Condition="'$(Configuration)' == 'Release'">true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(RecadRoot)build\native\bin\$(Configuration)\</OutDir>
+    <IntDir>$(RecadRoot)build\native\obj\$(MSBuildProjectName)\$(Configuration)\</IntDir>
+    <TargetExt>.exe</TargetExt>
+  </PropertyGroup>
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(CudaToolkitCustomDir)extras\visual_studio_integration\MSBuildExtensions\CUDA 13.2.props" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup>
+    <RecadDependencyRoot>$(RecadRoot).deps\installed\x64-windows</RecadDependencyRoot>
+    <RecadDependencyConfiguration Condition="'$(Configuration)' == 'Debug'">debug\</RecadDependencyConfiguration>
+    <RecadLibraryDir>$(RecadDependencyRoot)\$(RecadDependencyConfiguration)lib</RecadLibraryDir>
+    <RecadRuntimeDir>$(RecadDependencyRoot)\$(RecadDependencyConfiguration)bin</RecadRuntimeDir>
+    <RecadIncludeDirs>$(RecadRoot)include;$(RecadDependencyRoot)\include;$(RecadDependencyRoot)\include\opencascade;$(RecadDependencyRoot)\include\eigen3;$(RecadRoot).deps\tinygltf\include</RecadIncludeDirs>
+    <RecadDefinitions>NOMINMAX;WIN32_LEAN_AND_MEAN;_USE_MATH_DEFINES;RECAD_PROJECT_VERSION="0.1.0"</RecadDefinitions>
+    <RecadCudaArchitecture Condition="'$(RecadCudaArchitecture)' == ''">120</RecadCudaArchitecture>
+    <LocalDebuggerCommand>$(OutDir)$(TargetName)$(TargetExt)</LocalDebuggerCommand>
+    <LocalDebuggerWorkingDirectory>$(RecadRoot)</LocalDebuggerWorkingDirectory>
+    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>$(RecadDefinitions);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(RecadIncludeDirs);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalOptions>/Zc:__cplusplus %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <CudaCompile>
+      <TargetMachinePlatform>64</TargetMachinePlatform>
+      <CodeGeneration>compute_$(RecadCudaArchitecture),sm_$(RecadCudaArchitecture)</CodeGeneration>
+      <AdditionalIncludeDirectories>$(RecadIncludeDirs);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>$(RecadDefinitions);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <GenerateRelocatableDeviceCode>true</GenerateRelocatableDeviceCode>
+      <CudaRuntime>Hybrid</CudaRuntime>
+      <GenerateLineInfo Condition="'$(Configuration)' == 'Release'">true</GenerateLineInfo>
+      <AdditionalOptions>--std=c++20 --extended-lambda --expt-relaxed-constexpr %(AdditionalOptions)</AdditionalOptions>
+    </CudaCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(RecadLibraryDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>draco.lib;TKernel.lib;TKMath.lib;TKG2d.lib;TKG3d.lib;TKGeomBase.lib;TKBRep.lib;TKGeomAlgo.lib;TKTopAlgo.lib;TKShHealing.lib;TKMesh.lib;TKBO.lib;TKBool.lib;TKPrim.lib;TKXSBase.lib;TKDESTEP.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+    </ClCompile>
+    <CudaCompile>
+      <Runtime>MDd</Runtime>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </CudaCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)' == 'Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+    </ClCompile>
+    <CudaCompile>
+      <Runtime>MD</Runtime>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </CudaCompile>
+    <Link>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <RecadRuntimeDll Include="$(RecadRuntimeDir)\*.dll" />
+    <RecadRuntimeDll Include="$(CudaToolkitCustomDir)bin\cudart64_*.dll;$(CudaToolkitCustomDir)bin\x64\cudart64_*.dll" />
+  </ItemGroup>
+</Project>

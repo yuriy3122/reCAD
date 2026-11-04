@@ -50,6 +50,9 @@ struct CudaTriangleSegmentationOptions {
     double maximumDihedralAngleRadians{0.5235987755982988}; // 30 degrees.
     double maximumCentroidDistance{};
     double maximumCentroidDistanceToEdgeRatio{};
+    // Principal curvature discontinuities separate tangent plane/cylinder/sphere
+    // regions. Estimated on CUDA from supplied smooth normals; zero disables.
+    double maximumRelativeCurvatureDifference{0.35};
     // Enable only for meshes whose winding could not be made consistent. When
     // enabled, n and -n are treated as the same orientation and the maximum
     // meaningful angle is pi/2.

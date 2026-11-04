@@ -99,9 +99,9 @@ double pointTriangleDistanceSquared(
     return squaredNorm(p - (a + ab * v + ac * w));
 }
 
-double exactPointShapeDistance(const Vec3d& p, const TopoDS_Shape& shape) {
+double exactPointShapeDistance(const Vec3d& p, BRepExtrema_DistShapeShape& query) {
     const TopoDS_Vertex vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(p.x, p.y, p.z));
-    BRepExtrema_DistShapeShape query(vertex, shape);
+    query.LoadS1(vertex);
     query.Perform();
     if (!query.IsDone() || query.NbSolution() == 0) {
         throw std::runtime_error("OpenCascade point-to-shape distance failed");
@@ -147,75 +147,68 @@ TriangleBvh::TriangleBvh(const Mesh& mesh) : mesh_(&mesh) {
 }
 
 std::uint32_t TriangleBvh::build(std::uint32_t begin, std::uint32_t end) {
-    const std::uint32_t nodeIndex = static_cast<std::uint32_t>(nodes_.size());
     nodes_.push_back({});
-    Aabb bounds;
-    bounds.minimum = {std::numeric_limits<double>::infinity(),
-                      std::numeric_limits<double>::infinity(),
-                      std::numeric_limits<double>::infinity()};
-    bounds.maximum = {-std::numeric_limits<double>::infinity(),
-                      -std::numeric_limits<double>::infinity(),
-                      -std::numeric_limits<double>::infinity()};
-    Aabb centroidBounds = bounds;
-    for (std::uint32_t i = begin; i < end; ++i) {
-        const Triangle& triangle = mesh_->triangles[indices_[i]];
-        const Vec3d& a = mesh_->vertices[triangle.vertices[0]];
-        const Vec3d& b = mesh_->vertices[triangle.vertices[1]];
-        const Vec3d& c = mesh_->vertices[triangle.vertices[2]];
-        bounds.minimum = minimum(bounds.minimum, minimum(a, minimum(b, c)));
-        bounds.maximum = maximum(bounds.maximum, maximum(a, maximum(b, c)));
-        const Vec3d center = (a + b + c) / 3.0;
-        centroidBounds.minimum = minimum(centroidBounds.minimum, center);
-        centroidBounds.maximum = maximum(centroidBounds.maximum, center);
+    nodes_[0].begin = begin;
+    nodes_[0].count = end - begin;
+    for (std::size_t index = 0; index < nodes_.size(); ++index) {
+        const auto first = nodes_[index].begin;
+        const auto last = first + nodes_[index].count;
+        Aabb bounds, centroids;
+        for (auto i = first; i < last; ++i) {
+            const auto& triangle = mesh_->triangles[indices_[i]];
+            for (const auto vertex : triangle.vertices) bounds.expand(mesh_->vertices[vertex]);
+            centroids.expand(mesh_->features[indices_[i]].centroid);
+        }
+        nodes_[index].bounds = bounds;
+        if (nodes_[index].count <= 8) {
+            nodes_[index].leaf = true;
+            continue;
+        }
+        const Vec3d extent = centroids.extent();
+        const int axis = extent.y > extent.x ? (extent.z > extent.y ? 2 : 1)
+                                              : (extent.z > extent.x ? 2 : 0);
+        const auto middle = first + (last - first) / 2;
+        std::nth_element(indices_.begin() + first, indices_.begin() + middle,
+            indices_.begin() + last, [&](std::uint32_t a, std::uint32_t b) {
+                return component(mesh_->features[a].centroid, axis) <
+                       component(mesh_->features[b].centroid, axis);
+            });
+        const auto left = static_cast<std::uint32_t>(nodes_.size());
+        nodes_.push_back({});
+        nodes_.push_back({});
+        nodes_[index].left = left;
+        nodes_[index].right = left + 1;
+        nodes_[left].begin = first;
+        nodes_[left].count = middle - first;
+        nodes_[left + 1].begin = middle;
+        nodes_[left + 1].count = last - middle;
     }
-
-    Node& node = nodes_[nodeIndex];
-    node.bounds = bounds;
-    node.begin = begin;
-    node.count = end - begin;
-    if (node.count <= 8) {
-        node.leaf = true;
-        return nodeIndex;
-    }
-
-    const Vec3d extent = centroidBounds.maximum - centroidBounds.minimum;
-    const int axis = extent.y > extent.x ? (extent.z > extent.y ? 2 : 1)
-                                          : (extent.z > extent.x ? 2 : 0);
-    const std::uint32_t middle = begin + (end - begin) / 2;
-    std::nth_element(indices_.begin() + begin, indices_.begin() + middle,
-                     indices_.begin() + end, [&](std::uint32_t lhs, std::uint32_t rhs) {
-        return component(mesh_->features[lhs].centroid, axis) <
-               component(mesh_->features[rhs].centroid, axis);
-    });
-    const std::uint32_t left = build(begin, middle);
-    const std::uint32_t right = build(middle, end);
-    nodes_[nodeIndex].left = left;
-    nodes_[nodeIndex].right = right;
-    return nodeIndex;
+    return 0;
 }
 
 double TriangleBvh::distanceSquared(
-    std::uint32_t nodeIndex, const Vec3d& point, double best) const {
-    const Node& node = nodes_[nodeIndex];
-    if (pointAabbDistanceSquared(point, node.bounds) >= best) return best;
-    if (node.leaf) {
-        for (std::uint32_t i = node.begin; i < node.begin + node.count; ++i) {
-            const Triangle& triangle = mesh_->triangles[indices_[i]];
-            best = std::min(best, pointTriangleDistanceSquared(
-                point, mesh_->vertices[triangle.vertices[0]],
-                mesh_->vertices[triangle.vertices[1]],
-                mesh_->vertices[triangle.vertices[2]]));
+    std::uint32_t root, const Vec3d& point, double best) const {
+    // Median splits over uint32 indices have depth below 32.
+    std::array<std::uint32_t, 64> pending{};
+    std::size_t size = 1;
+    pending[0] = root;
+    while (size > 0) {
+        const Node& node = nodes_[pending[--size]];
+        if (pointAabbDistanceSquared(point, node.bounds) >= best) continue;
+        if (node.leaf) {
+            for (auto i = node.begin; i < node.begin + node.count; ++i) {
+                const auto& triangle = mesh_->triangles[indices_[i]];
+                best = std::min(best, pointTriangleDistanceSquared(point,
+                    mesh_->vertices[triangle[0]], mesh_->vertices[triangle[1]], mesh_->vertices[triangle[2]]));
+            }
+            continue;
         }
-        return best;
+        const double left = pointAabbDistanceSquared(point, nodes_[node.left].bounds);
+        const double right = pointAabbDistanceSquared(point, nodes_[node.right].bounds);
+        pending[size++] = left < right ? node.right : node.left;
+        pending[size++] = left < right ? node.left : node.right;
     }
-    const double leftDistance = pointAabbDistanceSquared(point, nodes_[node.left].bounds);
-    const double rightDistance = pointAabbDistanceSquared(point, nodes_[node.right].bounds);
-    if (leftDistance < rightDistance) {
-        best = distanceSquared(node.left, point, best);
-        return distanceSquared(node.right, point, best);
-    }
-    best = distanceSquared(node.right, point, best);
-    return distanceSquared(node.left, point, best);
+    return best;
 }
 
 double TriangleBvh::distance(const Vec3d& point) const {
@@ -231,12 +224,14 @@ DistanceStatistics meshToBrepDistance(
     // solid's interior, which is containment distance rather than the required
     // distance to the analytic B-Rep boundary.
     const TopoDS_Compound boundary = surfaceCompound(shape);
+    BRepExtrema_DistShapeShape query;
+    query.LoadS2(boundary);
     const std::size_t triangleStride = maximumSamples > 0U
         ? std::max<std::size_t>(1U, (mesh.triangles.size() + maximumSamples - 1U) / maximumSamples)
         : 1U;
     for (std::size_t i = 0; i < mesh.triangles.size(); i += triangleStride) {
         if (mesh.features[i].degenerate || mesh.features[i].area <= 0.0) continue;
-        const double distance = exactPointShapeDistance(mesh.features[i].centroid, boundary);
+        const double distance = exactPointShapeDistance(mesh.features[i].centroid, query);
         addSample(result, distance, mesh.features[i].area);
     }
     if (includeVertexMaximum) {
@@ -245,7 +240,7 @@ DistanceStatistics meshToBrepDistance(
             : 1U;
         for (std::size_t i = 0; i < mesh.vertices.size(); i += vertexStride) {
             const Vec3d& vertex = mesh.vertices[i];
-            result.maximum = std::max(result.maximum, exactPointShapeDistance(vertex, boundary));
+            result.maximum = std::max(result.maximum, exactPointShapeDistance(vertex, query));
         }
     }
     finish(result);
@@ -267,8 +262,8 @@ DistanceStatistics brepToMeshDistance(
         const Handle(Poly_Triangulation) triangulation = BRep_Tool::Triangulation(face, location);
         if (triangulation.IsNull()) continue;
         const gp_Trsf transform = location.Transformation();
-        const BRepAdaptor_Surface exactSurface(face, true);
-        const bool hasUvNodes = triangulation->HasUVNodes();
+        BRepExtrema_DistShapeShape projection;
+        projection.LoadS2(face);
         for (int i = 1; i <= triangulation->NbTriangles(); ++i) {
             int ia = 0, ib = 0, ic = 0;
             triangulation->Triangle(i).Get(ia, ib, ic);
@@ -277,19 +272,14 @@ DistanceStatistics brepToMeshDistance(
             const Vec3d c = toVec(triangulation->Node(ic).Transformed(transform));
             const double area = 0.5 * norm(cross(b - a, c - a));
             if (area <= 0.0) continue;
-            const double nodeWeight = area / (hasUvNodes ? 4.0 : 3.0);
+            const double nodeWeight = area / 4.0;
             addSample(result, bvh.distance(a), nodeWeight);
             addSample(result, bvh.distance(b), nodeWeight);
             addSample(result, bvh.distance(c), nodeWeight);
-            if (hasUvNodes) {
-                const gp_Pnt2d uva = triangulation->UVNode(ia);
-                const gp_Pnt2d uvb = triangulation->UVNode(ib);
-                const gp_Pnt2d uvc = triangulation->UVNode(ic);
-                const double u = (uva.X() + uvb.X() + uvc.X()) / 3.0;
-                const double v = (uva.Y() + uvb.Y() + uvc.Y()) / 3.0;
-                const gp_Pnt exactPoint = exactSurface.Value(u, v);
-                addSample(result, bvh.distance(toVec(exactPoint)), area / 4.0);
-            }
+            // Project onto the trimmed face; UV interpolation can cross seams
+            // or holes and introduce validation points outside the source face.
+            exactPointShapeDistance((a + b + c) / 3.0, projection);
+            addSample(result, bvh.distance(toVec(projection.PointOnShape2(1))), nodeWeight);
         }
     }
     finish(result);

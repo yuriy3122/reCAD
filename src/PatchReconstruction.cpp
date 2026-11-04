@@ -22,6 +22,7 @@
 #include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <Geom_BSplineSurface.hxx>
 #include <Geom_CylindricalSurface.hxx>
+#include <Geom_ConicalSurface.hxx>
 #include <Geom_Plane.hxx>
 #include <Geom_SphericalSurface.hxx>
 #include <Geom_Surface.hxx>
@@ -32,6 +33,7 @@
 #include <Precision.hxx>
 #include <ShapeFix_Shape.hxx>
 #include <ShapeFix_Solid.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <Standard_Failure.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp.hxx>
@@ -441,6 +443,19 @@ struct ProjectedLoop {
             gp_Ax3(toPoint(cylinder->axisPoint), toDirection(axis), toDirection(radial)),
             cylinder->radius);
     }
+    case SurfaceKind::Cone: {
+        const auto* cone = std::get_if<ConeSurface>(&patch.parameters);
+        if (cone == nullptr || !finitePoint(cone->apex) || !finitePoint(cone->axisDirection) ||
+            !(cone->semiAngle > 0.0 && cone->semiAngle < 1.5707963267948966)) {
+            throw std::invalid_argument("cone parameters are invalid or mismatched");
+        }
+        const Vec3d axis = normalizedVector(cone->axisDirection);
+        Vec3d radial = moments.centroid - cone->apex;
+        radial -= axis * dotProduct(radial, axis);
+        if (vectorLength(radial) == 0.0) radial = stablePerpendicular(axis);
+        return new Geom_ConicalSurface(gp_Ax3(toPoint(cone->apex), toDirection(axis),
+                                             toDirection(radial * -1.0)), cone->semiAngle, 0.0);
+    }
     case SurfaceKind::Sphere: {
         const SphereSurface* sphere = std::get_if<SphereSurface>(&patch.parameters);
         if (sphere == nullptr || !finitePoint(sphere->center) ||
@@ -449,11 +464,10 @@ struct ProjectedLoop {
         }
         Vec3d radial = normalizedVector(moments.centroid - sphere->center);
         if (!(vectorLength(radial) > 0.0)) radial = {1.0, 0.0, 0.0};
-        // Put a pole opposite the observed patch. A spherical patch can cover
-        // more than a hemisphere; placing its seam opposite the centroid
-        // alone makes its boundary wind around both parameter-space poles.
-        const Vec3d zDirection = radial * -1.0;
-        const Vec3d xDirection = stablePerpendicular(zDirection);
+        // Put chart geometry near the equator, with the seam on the opposite
+        // side. Wide spherical regions are divided into bounded charts below.
+        const Vec3d zDirection = stablePerpendicular(radial);
+        const Vec3d xDirection = radial * -1.0;
         return new Geom_SphericalSurface(
             gp_Ax3(toPoint(sphere->center),
                    toDirection(zDirection),
@@ -706,56 +720,82 @@ void orientFaceToPatch(TopoDS_Face& face,
     if (alignment < 0.0) face.Reverse();
 }
 
-[[nodiscard]] bool tryPeriodicBandFace(
+// Cut a periodic annulus into two ordinary UV charts. Both boundary curves
+// retain their measured height variation; they need not be coaxial circles.
+[[nodiscard]] bool makePeriodicBandFaces(
     const Handle(Geom_Surface)& surface,
     const std::vector<ProjectedLoop>& loops,
     double tolerance,
-    TopoDS_Face& face) {
+    std::vector<TopoDS_Face>& faces) {
     if (loops.size() != 2U) return false;
-    double surfaceUMin{};
-    double surfaceUMax{};
-    double surfaceVMin{};
-    double surfaceVMax{};
-    surface->Bounds(surfaceUMin, surfaceUMax, surfaceVMin, surfaceVMax);
-
-    const auto nearlyConstant = [](double low, double high, double mean) {
-        return high - low <= 1.0e-7 * std::max(1.0, std::abs(mean));
-    };
-    bool fullU = surface->IsUPeriodic() && loops[0].uWinding != 0 &&
-                 loops[1].uWinding != 0 &&
-                 nearlyConstant(loops[0].minimumV, loops[0].maximumV, loops[0].meanV) &&
-                 nearlyConstant(loops[1].minimumV, loops[1].maximumV, loops[1].meanV);
-    bool fullV = surface->IsVPeriodic() && loops[0].vWinding != 0 &&
-                 loops[1].vWinding != 0 &&
-                 nearlyConstant(loops[0].minimumU, loops[0].maximumU, loops[0].meanU) &&
-                 nearlyConstant(loops[1].minimumU, loops[1].maximumU, loops[1].meanU);
-    if (!fullU && !fullV) return false;
-
-    double uMinimum{};
-    double uMaximum{};
-    double vMinimum{};
-    double vMaximum{};
-    if (fullU) {
-        uMinimum = std::isfinite(surfaceUMin) ? surfaceUMin : loops[0].minimumU;
-        uMaximum = uMinimum + surface->UPeriod();
-        vMinimum = std::min(loops[0].meanV, loops[1].meanV);
-        vMaximum = std::max(loops[0].meanV, loops[1].meanV);
-    } else {
-        uMinimum = std::min(loops[0].meanU, loops[1].meanU);
-        uMaximum = std::max(loops[0].meanU, loops[1].meanU);
-        vMinimum = std::isfinite(surfaceVMin) ? surfaceVMin : loops[0].minimumV;
-        vMaximum = vMinimum + surface->VPeriod();
+    const bool alongU = surface->IsUPeriodic() &&
+        std::abs(loops[0].uWinding) == 1 && std::abs(loops[1].uWinding) == 1;
+    const bool alongV = surface->IsVPeriodic() &&
+        std::abs(loops[0].vWinding) == 1 && std::abs(loops[1].vWinding) == 1;
+    if (!alongU && !alongV) return false;
+    const double period = alongU ? surface->UPeriod() : surface->VPeriod();
+    std::array<std::vector<gp_Pnt2d>, 2> rings;
+    for (unsigned ring = 0; ring < 2; ++ring) {
+        auto parameters = loops[ring].parameters;
+        const auto winding = alongU ? loops[ring].uWinding : loops[ring].vWinding;
+        if (winding < 0) std::reverse(parameters.begin(), parameters.end());
+        double previous = -std::numeric_limits<double>::infinity();
+        for (const auto& parameter : parameters) {
+            double u = alongU ? parameter.X() : parameter.Y();
+            const double v = alongU ? parameter.Y() : parameter.X();
+            if (std::isfinite(previous)) u = unwrapNear(u, previous, period);
+            if (u < previous - 1.0e-8) {
+                throw std::runtime_error("Periodic boundary doubles back across a chart meridian");
+            }
+            previous = u;
+            u -= std::floor(u / period) * period;
+            rings[ring].emplace_back(u, v);
+        }
+        std::sort(rings[ring].begin(), rings[ring].end(),
+            [](const gp_Pnt2d& a, const gp_Pnt2d& b) { return a.X() < b.X(); });
     }
-    if (!(uMaximum > uMinimum) || !(vMaximum > vMinimum)) return false;
-    BRepBuilderAPI_MakeFace builder(surface,
-                                    uMinimum,
-                                    uMaximum,
-                                    vMinimum,
-                                    vMaximum,
-                                    tolerance);
-    if (!builder.IsDone()) return false;
-    face = builder.Face();
-    return !face.IsNull();
+    const auto heightAt = [&](const std::vector<gp_Pnt2d>& ring, double u) {
+        for (std::size_t i = 0; i < ring.size(); ++i) {
+            const auto& a = ring[i];
+            gp_Pnt2d b = ring[(i + 1) % ring.size()];
+            if (i + 1 == ring.size()) b.SetX(b.X() + period);
+            double query = u;
+            if (query < ring.front().X()) query += period;
+            if (query >= a.X() - 1.0e-10 && query <= b.X() + 1.0e-10) {
+                const double width = b.X() - a.X();
+                if (width <= 1.0e-12) return 0.5 * (a.Y() + b.Y());
+                return a.Y() + (b.Y() - a.Y()) * (query - a.X()) / width;
+            }
+        }
+        throw std::runtime_error("Periodic boundary does not cover the chart meridian");
+    };
+    if (heightAt(rings[0], 0.0) > heightAt(rings[1], 0.0)) std::swap(rings[0], rings[1]);
+    for (unsigned chart = 0; chart < 2; ++chart) {
+        const double start = period * chart / 2.0;
+        const double end = period * (chart + 1) / 2.0;
+        ProjectedLoop polygon;
+        for (unsigned ring = 0; ring < 2; ++ring) {
+            std::vector<gp_Pnt2d> arc;
+            arc.emplace_back(start, heightAt(rings[ring], start));
+            for (const auto& p : rings[ring]) {
+                if (p.X() > start + 1.0e-10 && p.X() < end - 1.0e-10) arc.push_back(p);
+            }
+            arc.emplace_back(end, heightAt(rings[ring], end == period ? 0.0 : end));
+            if (ring == 1) std::reverse(arc.begin(), arc.end());
+            for (const auto& p : arc) {
+                polygon.parameters.push_back(alongU ? p : gp_Pnt2d(p.Y(), p.X()));
+            }
+        }
+        const TopoDS_Wire wire = makeAnalyticWire(polygon, surface, tolerance);
+        BRepBuilderAPI_MakeFace builder(surface, wire, true);
+        if (!builder.IsDone()) throw std::runtime_error("Could not trim periodic surface chart");
+        const TopoDS_Face face = builder.Face();
+        if (!BRepLib::BuildCurves3d(face, tolerance) || !BRepCheck_Analyzer(face, true).IsValid()) {
+            throw std::runtime_error("Invalid periodic surface chart");
+        }
+        faces.push_back(face);
+    }
+    return true;
 }
 
 [[nodiscard]] std::vector<TopoDS_Face> makeAnalyticPatchFaces(
@@ -822,7 +862,6 @@ void orientFaceToPatch(TopoDS_Face& face,
         alignLoopToReference(loop, referenceU, referenceV, surface);
     }
 
-    TopoDS_Face periodicBand;
     // A sphere with one latitude boundary is a cap, including the common
     // complementary cap larger than a hemisphere. Select the pole from the
     // observed patch, rather than letting a UV polygon select the complement.
@@ -852,18 +891,7 @@ void orientFaceToPatch(TopoDS_Face& face,
             }
         }
     }
-    if (tryPeriodicBandFace(surface, projected, sewingTolerance, periodicBand)) {
-        orientFaceToPatch(periodicBand,
-                          surface,
-                          projected.front().parameters.front(),
-                          moments.normal);
-        BRep_Builder topologyBuilder;
-        topologyBuilder.UpdateFace(periodicBand, sewingTolerance);
-        if (!BRepLib::BuildCurves3d(periodicBand, sewingTolerance) ||
-            !BRepCheck_Analyzer(periodicBand, true).IsValid()) {
-            throw std::runtime_error("the periodic analytic band face is invalid");
-        }
-        faces.push_back(periodicBand);
+    if (makePeriodicBandFaces(surface, projected, sewingTolerance, faces)) {
         return faces;
     }
 
@@ -953,7 +981,7 @@ void orientFaceToPatch(TopoDS_Face& face,
 
 // GeomPlate accepts scattered constraints, unlike grid-based B-spline fitting.
 // A chart must project consistently to an initial TLS plane; folded/closed
-// patches are kept by the topology-preserving triangle fallback instead.
+// patches require another valid parameter chart or reconstruction fails.
 [[nodiscard]] Handle(Geom_Surface) fitNurbsPatch(
     const Mesh& mesh, const SurfacePatchFit& patch, double tolerance) {
     std::vector<std::vector<std::uint32_t>> loops;
@@ -1020,87 +1048,55 @@ void orientFaceToPatch(TopoDS_Face& face,
     return surface;
 }
 
-[[nodiscard]] TopoDS_Face makeTriangleBsplineFace(
-    const Vec3d& first,
-    const Vec3d& second,
-    const Vec3d& third,
-    const TopoDS_Vertex& firstVertex,
-    const TopoDS_Vertex& secondVertex,
-    const TopoDS_Vertex& thirdVertex,
-    double tolerance) {
-    const Vec3d fourth = second + third - first;
-    NCollection_Array2<gp_Pnt> poles(1, 2, 1, 2);
-    poles.SetValue(1, 1, toPoint(first));
-    poles.SetValue(2, 1, toPoint(second));
-    poles.SetValue(1, 2, toPoint(third));
-    poles.SetValue(2, 2, toPoint(fourth));
-
-    NCollection_Array1<double> uKnots(1, 2);
-    NCollection_Array1<double> vKnots(1, 2);
-    NCollection_Array1<int> uMultiplicities(1, 2);
-    NCollection_Array1<int> vMultiplicities(1, 2);
-    uKnots.SetValue(1, 0.0);
-    uKnots.SetValue(2, 1.0);
-    vKnots.SetValue(1, 0.0);
-    vKnots.SetValue(2, 1.0);
-    uMultiplicities.SetValue(1, 2);
-    uMultiplicities.SetValue(2, 2);
-    vMultiplicities.SetValue(1, 2);
-    vMultiplicities.SetValue(2, 2);
-
-    const Handle(Geom_BSplineSurface) surface = new Geom_BSplineSurface(
-        poles,
-        uKnots,
-        vKnots,
-        uMultiplicities,
-        vMultiplicities,
-        1,
-        1,
-        false,
-        false);
-    const gp_Pnt2d uv0(0.0, 0.0);
-    const gp_Pnt2d uv1(1.0, 0.0);
-    const gp_Pnt2d uv2(0.0, 1.0);
-    const TopoDS_Edge edge01 = makeSurfaceEdge(surface, uv0, uv1,
-                                               firstVertex, secondVertex);
-    const TopoDS_Edge edge12 = makeSurfaceEdge(surface, uv1, uv2,
-                                               secondVertex, thirdVertex);
-    const TopoDS_Edge edge20 = makeSurfaceEdge(surface, uv2, uv0,
-                                               thirdVertex, firstVertex);
-    BRepBuilderAPI_MakeWire wireBuilder;
-    wireBuilder.Add(edge01);
-    wireBuilder.Add(edge12);
-    wireBuilder.Add(edge20);
-    if (!wireBuilder.IsDone()) {
-        throw std::runtime_error("OpenCascade could not close a fallback triangle wire");
-    }
-    BRepBuilderAPI_MakeFace faceBuilder(surface, wireBuilder.Wire(), true);
-    if (!faceBuilder.IsDone()) {
-        throw std::runtime_error("OpenCascade could not trim a fallback triangle face");
-    }
-    TopoDS_Face face = faceBuilder.Face();
-    BRep_Builder topologyBuilder;
-    topologyBuilder.UpdateFace(face, tolerance);
-    if (!BRepLib::BuildCurves3d(face, tolerance)) {
-        throw std::runtime_error("OpenCascade could not build fallback edge curves in 3D");
-    }
-    return face;
-}
-
 [[nodiscard]] std::string patchDiagnostic(
     std::size_t patchIndex,
     const std::string& reason) {
     std::ostringstream message;
-    message << "Patch " << patchIndex << " used triangle fallback: " << reason;
+    message << "Patch " << patchIndex << " reconstruction failed: " << reason;
     return message.str();
 }
 
-[[nodiscard]] std::string triangleDiagnostic(
-    std::size_t triangleIndex,
-    const std::string& reason) {
-    std::ostringstream message;
-    message << "Triangle " << triangleIndex << " was skipped: " << reason;
-    return message.str();
+// Spherical coordinates have two poles and a seam. A broad patch with holes
+// cannot be represented as one ordinary UV polygon. Six directional charts
+// bound angular extent; connectivity separates islands within each chart.
+std::vector<SurfacePatchFit> parameterCharts(const Mesh& mesh, const SurfacePatchFit& patch) {
+    if (patch.kind != SurfaceKind::Sphere) return {patch};
+    const auto& sphere = std::get<SphereSurface>(patch.parameters);
+    const auto moments = patchMoments(mesh, patch);
+    const Vec3d direction = normalizedVector(moments.centroid - sphere.center);
+    bool bounded = vectorLength(direction) > 0.0;
+    for (const auto triangle : patch.triangleIndices) {
+        for (const auto vertex : mesh.triangles[triangle].vertices) {
+            if (dotProduct(direction, normalizedVector(mesh.vertices[vertex] - sphere.center)) < 0.25) bounded = false;
+        }
+    }
+    if (bounded) return {patch};
+    std::vector<int> chart(mesh.triangles.size(), -1);
+    for (const auto triangle : patch.triangleIndices) {
+        const Vec3d radial = mesh.features[triangle].centroid - sphere.center;
+        unsigned axis = 0;
+        if (std::abs(radial.y) > std::abs(radial.x)) axis = 1;
+        if (std::abs(radial.z) > std::abs(radial[axis])) axis = 2;
+        chart[triangle] = static_cast<int>(2 * axis + (radial[axis] < 0.0 ? 1 : 0));
+    }
+    std::vector<unsigned char> visited(mesh.triangles.size(), 0);
+    std::vector<SurfacePatchFit> charts;
+    for (const auto seed : patch.triangleIndices) {
+        if (visited[seed]) continue;
+        SurfacePatchFit part = patch;
+        part.triangleIndices = {seed};
+        visited[seed] = 1;
+        for (std::size_t head = 0; head < part.triangleIndices.size(); ++head) {
+            for (const auto neighbor : mesh.triangleNeighbors[part.triangleIndices[head]]) {
+                if (!visited[neighbor] && chart[neighbor] == chart[seed]) {
+                    visited[neighbor] = 1;
+                    part.triangleIndices.push_back(neighbor);
+                }
+            }
+        }
+        charts.push_back(std::move(part));
+    }
+    return charts;
 }
 
 } // namespace
@@ -1160,15 +1156,17 @@ PatchReconstructionResult buildPatchReconstruction(
     }
 
     BRepBuilderAPI_Sewing sewing(result.sewingTolerance, true, true, true, false);
-    std::vector<bool> useFallback(mesh.triangles.size(), false);
-    for (std::size_t triangleIndex = 0; triangleIndex < triangleOwner.size(); ++triangleIndex) {
-        useFallback[triangleIndex] = triangleOwner[triangleIndex] < 0;
+    if (std::any_of(triangleOwner.begin(), triangleOwner.end(),
+                    [](std::int32_t owner) { return owner < 0; })) {
+        result.diagnostics.emplace_back("Every triangle must belong to a fitted surface patch");
+        return result;
     }
 
     for (std::size_t patchIndex = 0; patchIndex < patches.size(); ++patchIndex) {
         const SurfacePatchFit& patch = patches[patchIndex];
         const bool supportedAnalytic = patch.accepted &&
             (patch.kind == SurfaceKind::Plane || patch.kind == SurfaceKind::Cylinder ||
+             patch.kind == SurfaceKind::Cone ||
              patch.kind == SurfaceKind::Sphere || patch.kind == SurfaceKind::Torus);
         if (!supportedAnalytic || patch.triangleIndices.empty()) {
             if (options.enableNurbsFitting && patch.triangleIndices.size() >= 4U) {
@@ -1191,16 +1189,13 @@ PatchReconstructionResult buildPatchReconstruction(
                     result.diagnostics.push_back(std::string("NURBS fitting: ") + failure.what());
                 }
             }
-            for (const std::uint32_t triangleIndex : patch.triangleIndices) {
-                useFallback[triangleIndex] = true;
-            }
             if (!patch.triangleIndices.empty()) {
                 result.diagnostics.push_back(patchDiagnostic(
                     patchIndex,
                     patch.diagnostic.empty() ? "no analytic model was accepted"
                                              : patch.diagnostic));
             }
-            continue;
+            return result;
         }
 
         const double projectionLimit = options.maximumBoundaryProjectionDistance > 0.0
@@ -1211,106 +1206,29 @@ PatchReconstructionResult buildPatchReconstruction(
                            : 0.0);
         try {
             double observedProjectionDistance = 0.0;
-            const std::vector<TopoDS_Face> faces = makeAnalyticPatchFaces(
-                mesh,
-                patch,
-                constructionTolerance,
-                projectionLimit,
-                observedProjectionDistance);
-            for (const TopoDS_Face& face : faces) sewing.Add(face);
+            std::size_t count = 0;
+            for (const auto& chart : parameterCharts(mesh, patch)) {
+                const auto faces = makeAnalyticPatchFaces(mesh, chart, constructionTolerance,
+                    projectionLimit, observedProjectionDistance);
+                for (const auto& face : faces) sewing.Add(face);
+                count += faces.size();
+            }
             ++result.acceptedAnalyticPatchCount;
-            result.analyticFaceCount += faces.size();
+            result.analyticFaceCount += count;
         } catch (const Standard_Failure& error) {
             ++result.analyticPatchFailureCount;
-            for (const std::uint32_t triangleIndex : patch.triangleIndices) {
-                useFallback[triangleIndex] = true;
-            }
             result.diagnostics.push_back(patchDiagnostic(
                 patchIndex,
                 error.what() != nullptr ? error.what()
                                         : "OpenCascade analytic construction failure"));
+            return result;
         } catch (const std::exception& error) {
             ++result.analyticPatchFailureCount;
-            for (const std::uint32_t triangleIndex : patch.triangleIndices) {
-                useFallback[triangleIndex] = true;
-            }
             result.diagnostics.push_back(patchDiagnostic(patchIndex, error.what()));
+            return result;
         }
     }
 
-    BRep_Builder topologyBuilder;
-    std::vector<TopoDS_Vertex> fallbackVertices(mesh.vertices.size());
-    std::vector<bool> usableVertex(mesh.vertices.size(), false);
-    for (std::size_t vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex) {
-        if (!finitePoint(mesh.vertices[vertexIndex])) continue;
-        fallbackVertices[vertexIndex] =
-            BRepBuilderAPI_MakeVertex(toPoint(mesh.vertices[vertexIndex])).Vertex();
-        topologyBuilder.UpdateVertex(fallbackVertices[vertexIndex], constructionTolerance);
-        usableVertex[vertexIndex] = true;
-    }
-    const double scale = std::max(meshScale(mesh), 1.0);
-    const double twiceAreaThreshold =
-        std::numeric_limits<double>::epsilon() * scale * scale * 16.0;
-    for (std::size_t triangleIndex = 0; triangleIndex < mesh.triangles.size(); ++triangleIndex) {
-        if (!useFallback[triangleIndex]) continue;
-        ++result.fallbackTriangleCount;
-        const Triangle& triangle = mesh.triangles[triangleIndex];
-        const std::size_t firstIndex = triangle[0];
-        const std::size_t secondIndex = triangle[1];
-        const std::size_t thirdIndex = triangle[2];
-        if (firstIndex >= mesh.vertices.size() || secondIndex >= mesh.vertices.size() ||
-            thirdIndex >= mesh.vertices.size() || firstIndex == secondIndex ||
-            secondIndex == thirdIndex || thirdIndex == firstIndex ||
-            !usableVertex[firstIndex] || !usableVertex[secondIndex] ||
-            !usableVertex[thirdIndex]) {
-            ++result.skippedTriangleCount;
-            result.diagnostics.push_back(
-                triangleDiagnostic(triangleIndex, "its vertices are invalid or repeated"));
-            continue;
-        }
-        const Vec3d& first = mesh.vertices[firstIndex];
-        const Vec3d& second = mesh.vertices[secondIndex];
-        const Vec3d& third = mesh.vertices[thirdIndex];
-        const double twiceArea = vectorLength(crossProduct(second - first, third - first));
-        if (!std::isfinite(twiceArea) || twiceArea <= twiceAreaThreshold) {
-            ++result.skippedTriangleCount;
-            result.diagnostics.push_back(
-                triangleDiagnostic(triangleIndex, "it is geometrically degenerate"));
-            continue;
-        }
-        try {
-            const TopoDS_Face face = makeTriangleBsplineFace(
-                first,
-                second,
-                third,
-                fallbackVertices[firstIndex],
-                fallbackVertices[secondIndex],
-                fallbackVertices[thirdIndex],
-                constructionTolerance);
-            if (!BRepCheck_Analyzer(face, true).IsValid()) {
-                ++result.skippedTriangleCount;
-                result.diagnostics.push_back(
-                    triangleDiagnostic(triangleIndex, "OpenCascade produced an invalid face"));
-                continue;
-            }
-            sewing.Add(face);
-            ++result.fallbackFaceCount;
-        } catch (const Standard_Failure& error) {
-            ++result.skippedTriangleCount;
-            result.diagnostics.push_back(triangleDiagnostic(
-                triangleIndex,
-                error.what() != nullptr ? error.what()
-                                        : "OpenCascade fallback construction failure"));
-        } catch (const std::exception& error) {
-            ++result.skippedTriangleCount;
-            result.diagnostics.push_back(triangleDiagnostic(triangleIndex, error.what()));
-        }
-    }
-
-    if (result.analyticFaceCount + result.fittedNurbsFaceCount + result.fallbackFaceCount == 0U) {
-        result.diagnostics.emplace_back("No valid analytic or fallback faces were constructed");
-        return result;
-    }
     try {
         sewing.Perform();
     } catch (const Standard_Failure& error) {
@@ -1399,7 +1317,10 @@ PatchReconstructionResult buildPatchReconstruction(
             error.what() != nullptr ? error.what() : "OpenCascade shape healing failed");
     }
 
-    result.shape = combined;
+    ShapeUpgrade_UnifySameDomain unifier(combined, true, true, false);
+    unifier.SetLinearTolerance(constructionTolerance);
+    unifier.Build();
+    result.shape = unifier.Shape();
     result.shellCount = countSubshapes(result.shape, TopAbs_SHELL);
     result.closedShellCount = countClosedShells(result.shape);
     result.solidCount = countSubshapes(result.shape, TopAbs_SOLID);

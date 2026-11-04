@@ -13,8 +13,8 @@
     <ClCompile Include="src\Distance.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\CadReconstruction.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\SurfaceFitting.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\GraphCut.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\PatchReconstruction.cpp"><Filter>Source Files</Filter></ClCompile>
-    <ClCompile Include="src\GeneralReconstruction.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\ReferenceValidation.cpp"><Filter>Source Files</Filter></ClCompile>
     <CudaCompile Include="src\CudaGeometry.cu"><Filter>Source Files</Filter></CudaCompile>
   </ItemGroup>
@@ -25,8 +25,8 @@
     <ClInclude Include="include\CudaGeometry.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\CadReconstruction.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\SurfaceFitting.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="include\GraphCut.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\PatchReconstruction.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="include\GeneralReconstruction.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="include\ReferenceValidation.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>

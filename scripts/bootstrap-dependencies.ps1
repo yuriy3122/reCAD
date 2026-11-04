@@ -40,6 +40,8 @@ if (Test-Path -LiteralPath $vs2022) {
 }
 
 & $vcpkg install `
+    --classic `
+    draco:x64-windows `
     opencascade:x64-windows `
     stb:x64-windows `
     eigen3:x64-windows `

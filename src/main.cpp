@@ -1,6 +1,5 @@
 #include "CadReconstruction.h"
 #include "CudaGeometry.h"
-#include "GeneralReconstruction.h"
 #include "MeshLoader.h"
 #include "PatchReconstruction.h"
 #include "SurfaceFitting.h"
@@ -46,10 +45,10 @@ struct CommandLine {
     double inputScale{1000.0};
     double smoothAngleDegrees{30.0};
     double fitTolerance{};
-    bool forceNurbs{};
     bool verify{};
     fs::path referenceStep;
     bool referenceZUp{};
+    std::size_t referenceSamples{512};
     bool verifyAnalytic{};
     bool ignoreSourcePatches{};
 };
@@ -101,14 +100,19 @@ CommandLine parseCommandLine(int argc, char** argv) {
             if (result.fitTolerance < 0.0) {
                 throw std::invalid_argument("--fit-tolerance must be non-negative");
             }
-        } else if (argument == "--force-nurbs") {
-            result.forceNurbs = true;
+
         } else if (argument == "--ignore-source-patches") {
             result.ignoreSourcePatches = true;
         } else if (argument == "--reference-step") {
             result.referenceStep = fs::path(requireValue("--reference-step"));
         } else if (argument == "--reference-z-up") {
             result.referenceZUp = true;
+        } else if (argument == "--reference-samples") {
+            const double value = parseNumber(requireValue("--reference-samples"), "--reference-samples");
+            if (value < 1 || value > 1000000 || std::floor(value) != value) {
+                throw std::invalid_argument("--reference-samples must be an integer in [1, 1000000]");
+            }
+            result.referenceSamples = static_cast<std::size_t>(value);
         } else if (argument == "--verify-analytic") {
             result.verify = true;
             result.verifyAnalytic = true;
@@ -121,10 +125,10 @@ CommandLine parseCommandLine(int argc, char** argv) {
                 << "  --input-scale value    GLB-to-STEP coordinate scale (default 1000)\n"
                 << "  --smooth-angle deg    CUDA adjacency threshold (default 30)\n"
                 << "  --fit-tolerance value Analytic surface tolerance; 0 is automatic\n"
-                << "  --force-nurbs          Skip analytic patch reconstruction\n"
                 << "  --ignore-source-patches Use geometric CUDA segmentation only\n"
                 << "  --reference-step path Compare against STEP after export\n"
                 << "  --reference-z-up      Rotate CAD reference into glTF Y-up frame\n"
+                << "  --reference-samples n Surface/edge sample limit per direction (default 512)\n"
                 << "  --verify-analytic     Also require all output faces to be analytic\n"
                 << "  --verify               Fail unless a valid close approximation is built\n";
             std::exit(0);
@@ -219,6 +223,10 @@ json surfacePatchJson(const SurfacePatchFit& patch) {
             {"axis_point", vectorJson(cylinder->axisPoint)},
             {"axis_direction", vectorJson(cylinder->axisDirection)},
             {"radius", cylinder->radius}};
+    } else if (const ConeSurface* cone = std::get_if<ConeSurface>(&patch.parameters)) {
+        result["parameters"] = {{"apex", vectorJson(cone->apex)},
+                                {"axis_direction", vectorJson(cone->axisDirection)},
+                                {"semi_angle_radians", cone->semiAngle}};
     } else if (const SphereSurface* sphere =
                    std::get_if<SphereSurface>(&patch.parameters)) {
         result["parameters"] = {
@@ -306,17 +314,8 @@ std::vector<std::int32_t> labelFittedPatches(
         }
     }
 
-    // Degenerate input is normally removed by MeshLoader. Preserve any
-    // unexpected uncovered triangle as an explicit NURBS fallback patch.
-    for (std::size_t triangle = 0; triangle < labels.size(); ++triangle) {
-        if (labels[triangle] >= 0) continue;
-        SurfacePatchFit fallback;
-        fallback.kind = SurfaceKind::Unknown;
-        fallback.triangleIndices.push_back(static_cast<std::uint32_t>(triangle));
-        fallback.residuals.area = mesh.features[triangle].area;
-        fallback.diagnostic = "Triangle was not assigned by analytic fitting";
-        labels[triangle] = static_cast<std::int32_t>(patches.size());
-        patches.push_back(std::move(fallback));
+    if (std::find(labels.begin(), labels.end(), -1) != labels.end()) {
+        throw std::runtime_error("Surface fitting left triangles unassigned");
     }
     return labels;
 }
@@ -326,11 +325,14 @@ std::vector<std::int32_t> labelFittedPatches(
 
 int main(int argc, char** argv) {
     using namespace recad;
+    fs::path statusPath;
     try {
         const CommandLine command = parseCommandLine(argc, argv);
         const fs::path inputPath = fs::absolute(command.input).lexically_normal();
         const fs::path outputDirectory = fs::absolute(command.output).lexically_normal();
         fs::create_directories(outputDirectory);
+        statusPath = outputDirectory / "run_status.json";
+        { std::ofstream status(statusPath); status << json{{"status", "running"}} << '\n'; }
 
         std::cout << "mesh2brep: CUDA-segmented analytic/NURBS reconstruction\n"
                   << "Input: " << inputPath.string() << "\n"
@@ -370,6 +372,7 @@ int main(int argc, char** argv) {
         fitOptions.positionTolerance = command.fitTolerance;
         fitOptions.minimumPatchAreaFraction = 1.0e-8;
         fitOptions.splitMixedRegions = true;
+        fitOptions.respectSourcePatchBoundaries = usefulSourcePatches;
         const auto fitStarted = std::chrono::steady_clock::now();
         std::vector<SurfacePatchFit> patches = fitSurfacePatches(
             mesh, segmentation.triangleLabels, fitOptions);
@@ -388,23 +391,34 @@ int main(int argc, char** argv) {
         }
         const double totalArea = meshSurfaceArea(mesh);
         const double analyticCoverage = totalArea > 0.0 ? analyticArea / totalArea : 0.0;
+        std::cout << "Mesh: " << mesh.vertices.size() << " vertices, "
+                  << mesh.triangles.size() << " triangles, " << mesh.stats.boundaryEdgeCount
+                  << " boundary edges; fitted " << patches.size() << " patches, "
+                  << acceptedAnalyticPatches << " analytic\n" << std::flush;
+        {
+            json fitting = {{"patches", json::array()},
+                            {"warnings", loaded.warnings},
+                            {"bounds_min", vectorJson(mesh.bounds.minimum)},
+                            {"bounds_max", vectorJson(mesh.bounds.maximum)},
+                            {"boundary_edges", mesh.stats.boundaryEdgeCount},
+                            {"non_manifold_edges", mesh.stats.nonManifoldEdgeCount}};
+            for (const auto& patch : patches) fitting["patches"].push_back(surfacePatchJson(patch));
+            std::ofstream stream(outputDirectory / "surface_fitting.json");
+            stream << std::setw(2) << fitting << '\n';
+        }
+        writeSegmentationPly(outputDirectory / "segmentation.ply", mesh, fittedLabels);
 
         const double modelScale = std::max(
             mesh.bounds.diagonal(), std::numeric_limits<double>::min());
-        const double sewingTolerance = std::max({
-            mesh.weldTolerance * 8.0,
-            modelScale * 2.0e-7,
-            std::numeric_limits<double>::epsilon() * modelScale * 256.0});
         const double comparisonDeflection = modelScale * 2.0e-4;
 
         TopoDS_Shape selectedShape;
         std::string reconstructionMethod;
         std::vector<std::string> reconstructionDiagnostics;
         PatchReconstructionResult patchReconstruction;
-        GeneralReconstructionResult nurbsFallback;
         BidirectionalDistance distances;
 
-        if (!command.forceNurbs) {
+        {
             const auto reconstructionStarted = std::chrono::steady_clock::now();
             PatchReconstructionOptions reconstructionOptions;
             // Let the patch builder include the tessellation chord sag when
@@ -432,8 +446,7 @@ int main(int argc, char** argv) {
                         maximum <= modelScale * 1.0e-2;
                     if (closeEnough) {
                         selectedShape = patchReconstruction.shape;
-                        reconstructionMethod = patchReconstruction.fallbackTriangleCount == 0U &&
-                                               patchReconstruction.fittedNurbsFaceCount == 0U
+                        reconstructionMethod = patchReconstruction.fittedNurbsFaceCount == 0U
                             ? "analytic_patches"
                             : "hybrid_analytic_nurbs";
                     } else {
@@ -450,18 +463,10 @@ int main(int argc, char** argv) {
         }
 
         if (selectedShape.IsNull()) {
-            nurbsFallback = buildNurbsFallback(mesh, sewingTolerance);
-            reconstructionDiagnostics.insert(reconstructionDiagnostics.end(),
-                                             nurbsFallback.diagnostics.begin(),
-                                             nurbsFallback.diagnostics.end());
-            if (!nurbsFallback.succeeded) {
-                throw std::runtime_error(
-                    "Both analytic patch reconstruction and NURBS fallback failed");
+            for (const auto& diagnostic : reconstructionDiagnostics) {
+                std::cerr << diagnostic << '\n';
             }
-            selectedShape = nurbsFallback.shape;
-            reconstructionMethod = "nurbs_mesh_fallback";
-            distances = compareMeshAndBrep(mesh, selectedShape,
-                                           comparisonDeflection, 256U);
+            throw std::runtime_error("Surface reconstruction failed; no substitute geometry exported");
         }
 
         const ShapeProperties properties = inspectShape(selectedShape);
@@ -479,6 +484,7 @@ int main(int argc, char** argv) {
         if (!command.referenceStep.empty()) {
             ReferenceValidationOptions referenceOptions;
             referenceOptions.referenceZUpToGltf = command.referenceZUp;
+            referenceOptions.maximumSamplesPerDirection = command.referenceSamples;
             referenceValidation = validateAgainstStepReference(
                 selectedShape, command.referenceStep, referenceOptions);
         }
@@ -553,14 +559,7 @@ int main(int argc, char** argv) {
                 {"succeeded", patchReconstruction.succeeded},
                 {"analytic_faces", patchReconstruction.analyticFaceCount},
                 {"fitted_nurbs_faces", patchReconstruction.fittedNurbsFaceCount},
-                {"fallback_faces", patchReconstruction.fallbackFaceCount},
-                {"fallback_triangles", patchReconstruction.fallbackTriangleCount},
                 {"analytic_patch_failures", patchReconstruction.analyticPatchFailureCount}
-            }},
-            {"full_nurbs_fallback", {
-                {"succeeded", nurbsFallback.succeeded},
-                {"faces", nurbsFallback.createdFaceCount},
-                {"skipped_triangles", nurbsFallback.skippedTriangleCount}
             }},
             {"brep_path", brepPath.string()},
             {"step_path", stepPath.string()}
@@ -570,6 +569,7 @@ int main(int argc, char** argv) {
             root["reference_validation"] = {
                 {"path", reference.referencePath.string()},
                 {"reference_z_up_to_gltf", command.referenceZUp},
+                {"sample_limit_per_direction", command.referenceSamples},
                 {"reference_loaded", reference.referenceLoaded},
                 {"properties_compared", reference.propertiesCompared},
                 {"distances_compared", reference.distancesCompared},
@@ -578,6 +578,7 @@ int main(int argc, char** argv) {
                 {"reference_faces", reference.reference.faceCount},
                 {"reference_planes", reference.reference.surfaces.planes},
                 {"reference_cylinders", reference.reference.surfaces.cylinders},
+                {"reference_cones", reference.reference.surfaces.cones},
                 {"reference_spheres", reference.reference.surfaces.spheres},
                 {"reference_tori", reference.reference.surfaces.tori},
                 {"topology_counts_match", reference.topology.exactMatch},
@@ -587,6 +588,10 @@ int main(int argc, char** argv) {
                     reference.properties.boundsMaximumCoordinateError},
                 {"symmetric_rms_mm", reference.distances.symmetricRms},
                 {"symmetric_max_mm", reference.distances.symmetricMaximum},
+                {"reconstructed_to_reference_max_point", vectorJson(reference.distances.reconstructedToReference.maximumPoint)},
+                {"reference_to_reconstructed_max_point", vectorJson(reference.distances.referenceToReconstructed.maximumPoint)},
+                {"reconstructed_max_on_boundary", reference.distances.reconstructedToReference.maximumOnBoundary},
+                {"reference_max_on_boundary", reference.distances.referenceToReconstructed.maximumOnBoundary},
                 {"normalized_rms", reference.distances.normalizedSymmetricRms},
                 {"normalized_max", reference.distances.normalizedSymmetricMaximum},
                 {"reconstructed_to_reference_samples",
@@ -624,9 +629,9 @@ int main(int argc, char** argv) {
                << " (area coverage " << analyticCoverage * 100.0 << "%)\n"
                << "Reconstruction method: " << reconstructionMethod << "\n"
                << "Valid closed solids: " << properties.solidCount << "\n"
-               << "Faces (plane/cylinder/sphere/torus/B-spline/other): "
+               << "Faces (plane/cylinder/cone/sphere/torus/B-spline/other): "
                << properties.planarFaceCount << "/" << properties.cylindricalFaceCount
-               << "/" << properties.sphericalFaceCount << "/"
+               << "/" << properties.conicalFaceCount << "/" << properties.sphericalFaceCount << "/"
                << properties.toroidalFaceCount << "/" << properties.bsplineFaceCount
                << "/" << properties.otherSurfaceCount << "\n"
                << "Mesh -> B-Rep RMS/max: " << distances.meshToBrep.rms << "/"
@@ -636,8 +641,8 @@ int main(int argc, char** argv) {
                << "STEP: " << stepPath.string() << "\n\n"
                << "Exact feature history cannot be guaranteed from a tessellated GLB. "
                   "Analytic surfaces are accepted only when their measured residuals pass; "
-                  "unresolved regions use fitted OpenCascade NURBS, with triangle-preserving "
-                  "fallback if surface fitting or solid assembly fails.\n";
+                  "unresolved regions require fitted OpenCascade NURBS. "
+                  "Failed fitting or solid assembly is reported as a failure.\n";
         if (referenceValidation) {
             const auto& reference = *referenceValidation;
             report << "STEP reference loaded: " << (reference.referenceLoaded ? "YES" : "NO")
@@ -675,8 +680,13 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("Reference validation did not complete");
             }
         }
+        { std::ofstream status(statusPath); status << json{{"status", "completed"}} << '\n'; }
         return 0;
     } catch (const std::exception& exception) {
+        if (!statusPath.empty()) {
+            std::ofstream status(statusPath);
+            status << json{{"status", "failed"}, {"error", exception.what()}} << '\n';
+        }
         std::cerr << "mesh2brep error: " << exception.what() << '\n';
         return 1;
     }

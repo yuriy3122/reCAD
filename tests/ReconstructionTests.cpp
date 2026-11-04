@@ -1,10 +1,14 @@
 #include "Geometry.h"
+#include "Distance.h"
+#include "GraphCut.h"
 #include "SurfaceFitting.h"
 #include "PatchReconstruction.h"
-#include "GeneralReconstruction.h"
 #include "ReferenceValidation.h"
 
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRep_Tool.hxx>
 #include <STEPControl_Reader.hxx>
@@ -13,6 +17,8 @@
 #include <gp_Pnt.hxx>
 
 #include <cmath>
+#include <algorithm>
+#include <limits>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -76,10 +82,136 @@ void testRotatedPrimitives() {
     }
 }
 
+void testIterativeBvh() {
+    Mesh mesh;
+    constexpr unsigned side = 32;
+    for (unsigned x = 0; x <= side; ++x) {
+        for (unsigned y = 0; y <= side; ++y) mesh.vertices.push_back({double(x), double(y), 0.0});
+    }
+    for (unsigned x = 0; x < side; ++x) {
+        for (unsigned y = 0; y < side; ++y) {
+            const unsigned a = x * (side + 1) + y, b = a + side + 1;
+            mesh.triangles.push_back({{a, b, b + 1}});
+            mesh.triangles.push_back({{a, b + 1, a + 1}});
+        }
+    }
+    finish(mesh);
+    const TriangleBvh bvh(mesh);
+    for (double x : {-3.5, 0.1, 17.2, 35.0}) {
+        for (double y : {-2.0, 9.3, 31.9, 34.0}) {
+            const double dx = std::max({0.0, -x, x - side});
+            const double dy = std::max({0.0, -y, y - side});
+            require(std::abs(bvh.distance({x, y, 2.0}) - std::sqrt(dx * dx + dy * dy + 4.0)) < 1.0e-10,
+                    "Iterative BVH must match exact distance to a tessellated rectangle");
+        }
+    }
+    const auto box = BRepPrimAPI_MakeBox(side, side, 2.0).Shape();
+    const auto coincident = meshToBrepDistance(mesh, box, true, 64);
+    require(coincident.maximum < 1.0e-7, "Cached OCCT queries must recognize a coincident mesh face");
+    for (auto& point : mesh.vertices) point.z -= 0.75;
+    computeTriangleFeatures(mesh);
+    const auto shifted = meshToBrepDistance(mesh, box, true, 64);
+    require(std::abs(shifted.rms - 0.75) < 1.0e-7 && std::abs(shifted.maximum - 0.75) < 1.0e-7,
+            "Cached point-to-boundary queries must retain the exact translated-plane distance");
+}
+
+void testGraphCuts() {
+    // Binary expansion must reach the exact minimum, checked independently
+    // against every labeling, including forbidden unary assignments.
+    constexpr std::size_t count = 7;
+    for (unsigned fixture = 0; fixture < 32; ++fixture) {
+        std::vector<double> costs(count * 2);
+        std::vector<int> initial(count, 0);
+        std::vector<PottsEdge> edges;
+        for (std::size_t i = 0; i < count; ++i) {
+            costs[i * 2] = double((fixture * 13 + i * 7) % 17) / 10.0;
+            costs[i * 2 + 1] = double((fixture * 3 + i * 11) % 19) / 10.0;
+            if (i > 0) edges.push_back({i - 1, i, 0.8});
+            if (i > 1) edges.push_back({i - 2, i, 0.3});
+        }
+        costs[3] = std::numeric_limits<double>::infinity();
+        const auto energy = [&](const std::vector<int>& labels) {
+            double value = 0.0;
+            for (std::size_t i = 0; i < count; ++i) value += costs[i * 2 + labels[i]];
+            for (const auto& edge : edges) if (labels[edge.first] != labels[edge.second]) value += edge.weight;
+            return value;
+        };
+        double best = std::numeric_limits<double>::infinity();
+        for (unsigned mask = 0; mask < (1U << count); ++mask) {
+            auto labels = initial;
+            for (std::size_t i = 0; i < count; ++i) labels[i] = (mask >> i) & 1;
+            best = std::min(best, energy(labels));
+        }
+        const auto fitted = minimizePottsEnergy(costs, 2, edges, initial);
+        require(std::abs(energy(fitted) - best) < 1.0e-8, "Graph cut must match the exhaustive binary optimum");
+        require(minimizePottsEnergy(costs, 2, edges, fitted) == fitted, "Converged graph labels must remain stable");
+    }
+    {
+        constexpr std::size_t length = 512;
+        std::vector<double> costs(length * 2);
+        std::vector<int> initial(length, 0);
+        std::vector<PottsEdge> edges;
+        std::array<double, 2> optimum{};
+        for (std::size_t i = 0; i < length; ++i) {
+            costs[i * 2] = double((i * 7) % 31) / 10.0;
+            costs[i * 2 + 1] = double((i * 11 + 3) % 29) / 10.0;
+            if (i > 0) {
+                edges.push_back({i - 1, i, 0.6});
+                optimum = {costs[i * 2] + std::min(optimum[0], optimum[1] + 0.6),
+                           costs[i * 2 + 1] + std::min(optimum[1], optimum[0] + 0.6)};
+            } else optimum = {costs[0], costs[1]};
+        }
+        const auto labels = minimizePottsEnergy(costs, 2, edges, initial);
+        double energy = 0.0;
+        for (std::size_t i = 0; i < length; ++i) energy += costs[i * 2 + labels[i]];
+        for (const auto& edge : edges) if (labels[edge.first] != labels[edge.second]) energy += edge.weight;
+        require(std::abs(energy - std::min(optimum[0], optimum[1])) < 1.0e-7,
+                "Large graph cut must match the independent dynamic-programming optimum");
+    }
+}
+
 struct GraphFixture {
     Mesh mesh;
     std::vector<SurfacePatchFit> patches;
 };
+
+void testConeFitting() {
+    const Vec3d axis = normalized(Vec3d{2.0, -3.0, 5.0});
+    const Vec3d x = normalized(cross(axis, Vec3d{0.0, 1.0, 0.0}));
+    const Vec3d y = cross(axis, x);
+    for (double scale : {0.01, 1.0, 100.0}) {
+        Mesh mesh;
+        std::vector<Vec3d> normals;
+        const Vec3d apex = Vec3d{-17.0, 23.0, 8.0} * scale;
+        constexpr unsigned count = 16;
+        constexpr double angle = 0.37;
+        for (unsigned i = 0; i <= count; ++i) {
+            const double u = -1.1 + 2.2 * i / count;
+            const Vec3d radial = x * std::cos(u) + y * std::sin(u);
+            for (unsigned j = 0; j <= count; ++j) {
+                const double height = scale * (3.0 + 4.0 * j / count);
+                mesh.vertices.push_back(apex + axis * height + radial * (height * std::tan(angle)));
+                normals.push_back(radial * std::cos(angle) - axis * std::sin(angle));
+            }
+        }
+        for (unsigned i = 0; i < count; ++i) {
+            for (unsigned j = 0; j < count; ++j) {
+                const unsigned a = i * (count + 1) + j, b = a + count + 1;
+                for (const Triangle triangle : {Triangle{{a, b, b + 1}}, Triangle{{a, b + 1, a + 1}}}) {
+                    mesh.triangles.push_back(triangle);
+                    mesh.cornerNormals.push_back({normals[triangle[0]], normals[triangle[1]], normals[triangle[2]]});
+                }
+            }
+        }
+        finish(mesh);
+        const auto fit = fitSurfacePatch(mesh, allTriangles(mesh));
+        require(fit.accepted && fit.kind == SurfaceKind::Cone, "Rotated/scaled cone must select cone family");
+        const auto cone = std::get<ConeSurface>(fit.parameters);
+        require(norm(cone.apex - apex) < scale * 1.0e-4 &&
+                std::abs(cone.semiAngle - angle) < 1.0e-5,
+                "Cone apex and opening must be recovered across coordinate scales");
+    }
+}
 
 GraphFixture graphSolid() {
     GraphFixture fixture;
@@ -136,7 +268,7 @@ GraphFixture graphSolid() {
     return fixture;
 }
 
-void testNurbsFittingAndFallback() {
+void testNurbsFittingAndFailure() {
     const auto fixture = graphSolid();
     PatchReconstructionOptions options;
     options.nurbsFitTolerance = 0.001;
@@ -147,12 +279,10 @@ void testNurbsFittingAndFallback() {
             "Unrecognized graph patch must be fitted as one OCCT NURBS face");
     require(fitted.succeeded && fitted.closed && fitted.valid,
             "Fitted NURBS graph solid must validate and close");
-    require(fitted.fallbackFaceCount == 0U, "Smooth NURBS test must avoid triangle fallback");
-    const auto preserved = buildNurbsFallback(fixture.mesh);
-    require(preserved.succeeded && preserved.solidCount == 1U,
-            "Triangle NURBS fallback must preserve a closed graph solid");
-    require(preserved.createdFaceCount == fixture.mesh.triangles.size(),
-            "Triangle fallback must preserve every input triangle");
+    options.enableNurbsFitting = false;
+    const auto rejected = buildPatchReconstruction(fixture.mesh, fixture.patches, options);
+    require(!rejected.succeeded && rejected.shape.IsNull(),
+            "An unresolved surface must fail without exporting substitute geometry");
 }
 
 void testReferenceDistances() {
@@ -167,6 +297,15 @@ void testReferenceDistances() {
     require(shifted.distancesCompared && shifted.distances.symmetricMaximum > 0.49 &&
             shifted.distances.symmetricMaximum < 0.51,
             "Boundary validation must detect a known translation");
+    const auto perforated = BRepAlgoAPI_Cut(
+        BRepPrimAPI_MakeSphere(7.3).Shape(),
+        BRepPrimAPI_MakeCylinder(gp_Ax2(gp_Pnt(0, 0, -10), gp_Dir(0, 0, 1)), 2.1, 20).Shape()).Shape();
+    const auto curved = compareShapesForValidation(perforated, perforated, options);
+    require(curved.distancesCompared && curved.distances.symmetricMaximum < 1.0e-6,
+            "Trimmed periodic surfaces must have zero self-distance");
+    const double exactVolume = 4.0 * pi / 3.0 * std::pow(7.3 * 7.3 - 2.1 * 2.1, 1.5);
+    require(std::abs(curved.reference.volume - exactVolume) < exactVolume * 1.0e-8,
+            "Trimmed curved mass properties must match the analytic napkin-ring volume");
 }
 } // namespace
 
@@ -180,7 +319,10 @@ int main(int argc, char** argv) {
         if (runCudaSegmentationTests() != 0) return 1;
 #endif
         testRotatedPrimitives();
-        testNurbsFittingAndFallback();
+        testIterativeBvh();
+        testGraphCuts();
+        testConeFitting();
+        testNurbsFittingAndFailure();
         testReferenceDistances();
         for (int i = 1; i < argc; ++i) {
             STEPControl_Reader reader;

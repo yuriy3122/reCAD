@@ -21,9 +21,10 @@
     <ClCompile Include="CudaSegmentationTests.cpp" />
     <ClCompile Include="ReconstructionTests.cpp" />
     <ClCompile Include="..\src\Geometry.cpp" />
+    <ClCompile Include="..\src\Distance.cpp" />
     <ClCompile Include="..\src\SurfaceFitting.cpp" />
+    <ClCompile Include="..\src\GraphCut.cpp" />
     <ClCompile Include="..\src\PatchReconstruction.cpp" />
-    <ClCompile Include="..\src\GeneralReconstruction.cpp" />
     <ClCompile Include="..\src\ReferenceValidation.cpp" />
     <CudaCompile Include="..\src\CudaGeometry.cu" />
   </ItemGroup>

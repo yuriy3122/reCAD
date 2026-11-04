@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #define TINYGLTF_IMPLEMENTATION
+#define TINYGLTF_ENABLE_DRACO
 #define TINYGLTF_NO_INCLUDE_JSON
 #define TINYGLTF_NO_STB_IMAGE
 #define TINYGLTF_NO_STB_IMAGE_WRITE
@@ -15,10 +16,11 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <functional>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -91,6 +93,18 @@ struct Mat4d {
     return a00 * (a11 * a22 - a12 * a21) -
            a01 * (a10 * a22 - a12 * a20) +
            a02 * (a10 * a21 - a11 * a20);
+}
+
+[[nodiscard]] Vec3d transformNormal(const Mat4d& transform, const Vec3d& normal) {
+    const Vec3d x{transform.values[0], transform.values[1], transform.values[2]};
+    const Vec3d y{transform.values[4], transform.values[5], transform.values[6]};
+    const Vec3d z{transform.values[8], transform.values[9], transform.values[10]};
+    const double determinant = dot(x, cross(y, z));
+    if (std::abs(determinant) <= std::numeric_limits<double>::min()) {
+        throw MeshLoadError("A node has a singular normal transform");
+    }
+    return normalized((cross(y, z) * normal.x + cross(z, x) * normal.y +
+                       cross(x, y) * normal.z) / determinant);
 }
 
 [[nodiscard]] Mat4d nodeTransform(const tinygltf::Node& node) {
@@ -667,7 +681,12 @@ void repairWinding(Mesh& mesh, std::vector<std::string>& warnings) {
     if (contradiction) warnings.emplace_back(
         "The mesh contains an orientation contradiction; a best-effort winding repair was applied");
     for (std::size_t i = 0; i < mesh.triangles.size(); ++i) {
-        if (flips[i] == 1) std::swap(mesh.triangles[i].vertices[1], mesh.triangles[i].vertices[2]);
+        if (flips[i] == 1) {
+            std::swap(mesh.triangles[i].vertices[1], mesh.triangles[i].vertices[2]);
+            if (mesh.cornerNormals.size() == mesh.triangles.size()) {
+                std::swap(mesh.cornerNormals[i][1], mesh.cornerNormals[i][2]);
+            }
+        }
     }
 
     // Choose outward orientation independently for each closed component. A
@@ -713,13 +732,74 @@ void repairWinding(Mesh& mesh, std::vector<std::string>& warnings) {
             for (const std::uint32_t triangleIndex : component) {
                 std::swap(mesh.triangles[triangleIndex].vertices[1],
                           mesh.triangles[triangleIndex].vertices[2]);
+                if (mesh.cornerNormals.size() == mesh.triangles.size()) {
+                    std::swap(mesh.cornerNormals[triangleIndex][1], mesh.cornerNormals[triangleIndex][2]);
+                }
             }
         }
     }
 }
 
+// Conform boundary edges to existing vertices. Removing a zero-area triangle
+// can expose a long edge opposite two shorter collinear edges (a T junction).
+// Split the incident facet at those existing vertices without moving geometry.
+void conformBoundaryEdges(Mesh& mesh, std::vector<std::string>& warnings) {
+    using Edge = std::pair<std::uint32_t, std::uint32_t>;
+    std::map<Edge, unsigned> incidence;
+    for (const auto& triangle : mesh.triangles) {
+        for (unsigned i = 0; i < 3; ++i) {
+            ++incidence[std::minmax(triangle[i], triangle[(i + 1) % 3])];
+        }
+    }
+    std::set<std::uint32_t> boundaryVertices;
+    for (const auto& [edge, count] : incidence) {
+        if (count == 1) {
+            boundaryVertices.insert(edge.first);
+            boundaryVertices.insert(edge.second);
+        }
+    }
+    if (boundaryVertices.empty()) return;
+    const double tolerance = mesh.weldTolerance * 2.0;
+    const auto originalCount = mesh.triangles.size();
+    for (std::size_t index = 0; index < mesh.triangles.size(); ++index) {
+        bool split = true;
+        while (split) {
+            split = false;
+            const Triangle triangle = mesh.triangles[index];
+            for (unsigned edge = 0; edge < 3 && !split; ++edge) {
+                const auto a = triangle[edge], b = triangle[(edge + 1) % 3];
+                const auto c = triangle[(edge + 2) % 3];
+                const Vec3d delta = mesh.vertices[b] - mesh.vertices[a];
+                const double lengthSquared = dot(delta, delta);
+                if (lengthSquared <= tolerance * tolerance) continue;
+                for (const auto vertex : boundaryVertices) {
+                    if (vertex == a || vertex == b || vertex == c) continue;
+                    const double t = dot(mesh.vertices[vertex] - mesh.vertices[a], delta) / lengthSquared;
+                    const double margin = tolerance / std::sqrt(lengthSquared);
+                    if (t <= margin || t >= 1.0 - margin) continue;
+                    if (norm(mesh.vertices[vertex] - (mesh.vertices[a] + delta * t)) > tolerance) continue;
+                    const auto normals = mesh.cornerNormals[index];
+                    const Vec3d n = normalized(normals[edge] * (1.0 - t) + normals[(edge + 1) % 3] * t);
+                    mesh.triangles[index] = Triangle{{a, vertex, c}};
+                    mesh.cornerNormals[index] = {normals[edge], n, normals[(edge + 2) % 3]};
+                    mesh.triangles.push_back(Triangle{{vertex, b, c}});
+                    mesh.cornerNormals.push_back({n, normals[(edge + 1) % 3], normals[(edge + 2) % 3]});
+                    mesh.sourcePatchLabels.push_back(mesh.sourcePatchLabels[index]);
+                    split = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (mesh.triangles.size() != originalCount) {
+        warnings.push_back("Split " + std::to_string(mesh.triangles.size() - originalCount) +
+                           " facets at boundary T junctions without changing their geometry");
+    }
+}
+
 [[nodiscard]] Mesh weldAndPrepare(std::vector<Vec3d> rawVertices,
                                   const std::vector<Triangle>& rawTriangles,
+                                  const std::vector<Vec3d>& rawNormals,
                                   const std::vector<std::uint32_t>& rawPatchLabels,
                                   std::size_t rawPatchCount,
                                   const MeshLoadOptions& options,
@@ -809,6 +889,9 @@ void repairWinding(Mesh& mesh, std::vector<std::string>& warnings) {
             ++mesh.stats.discardedDegenerateTriangles;
         } else {
             mesh.triangles.push_back(triangle);
+            mesh.cornerNormals.push_back({rawNormals.at(rawTriangle[0]),
+                                          rawNormals.at(rawTriangle[1]),
+                                          rawNormals.at(rawTriangle[2])});
             mesh.sourcePatchLabels.push_back(rawPatchLabels[rawTriangleIndex]);
         }
     }
@@ -836,6 +919,7 @@ void repairWinding(Mesh& mesh, std::vector<std::string>& warnings) {
         throw MeshLoadError("Source patch provenance lost triangle correspondence");
     }
 
+    conformBoundaryEdges(mesh, warnings);
     if (options.repairTriangleWinding) repairWinding(mesh, warnings);
     computeTriangleFeatures(mesh, degeneracyThreshold);
     rebuildTopology(mesh);
@@ -888,23 +972,14 @@ MeshLoadResult loadGlbMesh(const std::filesystem::path& path,
     if (!error.empty()) result.warnings.push_back("tinygltf: " + error);
 
     std::vector<Vec3d> rawVertices;
+    std::vector<Vec3d> rawNormals;
     std::vector<Triangle> rawTriangles;
-    std::vector<unsigned char> recursionStack(model.nodes.size(), 0U);
-    std::function<void(int, const Mat4d&, std::size_t)> visitNode;
-    visitNode = [&](int nodeIndex, const Mat4d& parentTransform, std::size_t depth) {
+    const auto appendNodeMesh = [&](int nodeIndex, const Mat4d& world) {
         if (nodeIndex < 0 || static_cast<std::size_t>(nodeIndex) >= model.nodes.size()) {
             throw MeshLoadError("A scene references an invalid node index");
         }
-        if (depth > model.nodes.size()) throw MeshLoadError("The glTF node hierarchy is cyclic");
-        if (recursionStack[static_cast<std::size_t>(nodeIndex)]) {
-            throw MeshLoadError("The glTF node hierarchy contains a cycle");
-        }
-        recursionStack[static_cast<std::size_t>(nodeIndex)] = 1U;
         ++result.visitedNodeCount;
         const tinygltf::Node& node = model.nodes[static_cast<std::size_t>(nodeIndex)];
-        const Mat4d world = options.applySceneTransforms
-            ? parentTransform * nodeTransform(node)
-            : Mat4d::identity();
         if (node.skin >= 0) {
             result.warnings.emplace_back("Skin deformation is not applied to static CAD mesh positions");
         }
@@ -923,6 +998,14 @@ MeshLoadResult loadGlbMesh(const std::filesystem::path& path,
                     continue;
                 }
                 std::vector<Vec3d> positions = readPositions(model, positionAttribute->second);
+                std::vector<Vec3d> normals(positions.size());
+                const auto normalAttribute = primitive.attributes.find("NORMAL");
+                if (normalAttribute != primitive.attributes.end()) {
+                    normals = readPositions(model, normalAttribute->second);
+                    if (normals.size() != positions.size()) {
+                        throw MeshLoadError("NORMAL and POSITION attribute counts differ");
+                    }
+                }
                 const std::vector<std::uint32_t> indices = readIndices(
                     model, primitive.indices, positions.size());
                 if (rawVertices.size() + positions.size() >
@@ -933,6 +1016,7 @@ MeshLoadResult loadGlbMesh(const std::filesystem::path& path,
                 for (const Vec3d& position : positions) {
                     rawVertices.push_back(transformPoint(world, position) * options.linearUnitScale);
                 }
+                for (const Vec3d& normal : normals) rawNormals.push_back(transformNormal(world, normal));
                 const std::size_t triangleCountBefore = rawTriangles.size();
                 appendPrimitiveTriangles(indices, primitive.mode, vertexBase,
                                          options.applySceneTransforms && linearDeterminant(world) < 0.0,
@@ -940,8 +1024,6 @@ MeshLoadResult loadGlbMesh(const std::filesystem::path& path,
                 if (rawTriangles.size() > triangleCountBefore) ++result.loadedPrimitiveCount;
             }
         }
-        for (const int child : node.children) visitNode(child, world, depth + 1U);
-        recursionStack[static_cast<std::size_t>(nodeIndex)] = 0U;
     };
 
     std::vector<int> rootNodes;
@@ -967,13 +1049,45 @@ MeshLoadResult loadGlbMesh(const std::filesystem::path& path,
         }
         result.warnings.emplace_back("The glTF has no scene; all root nodes were traversed");
     }
-    for (const int root : rootNodes) visitNode(root, Mat4d::identity(), 0U);
+    struct NodeVisit {
+        int index;
+        Mat4d parentTransform;
+        bool leaving{};
+    };
+    std::vector<NodeVisit> pending;
+    std::vector<unsigned char> active(model.nodes.size(), 0U);
+    for (auto root = rootNodes.rbegin(); root != rootNodes.rend(); ++root) {
+        pending.push_back({*root, Mat4d::identity(), false});
+    }
+    while (!pending.empty()) {
+        const NodeVisit visit = pending.back();
+        pending.pop_back();
+        if (visit.index < 0 || static_cast<std::size_t>(visit.index) >= model.nodes.size()) {
+            throw MeshLoadError("A scene references an invalid node index");
+        }
+        const auto index = static_cast<std::size_t>(visit.index);
+        if (visit.leaving) {
+            active[index] = 0U;
+            continue;
+        }
+        if (active[index]) throw MeshLoadError("The glTF node hierarchy contains a cycle");
+        active[index] = 1U;
+        const tinygltf::Node& node = model.nodes[index];
+        const Mat4d world = options.applySceneTransforms
+            ? visit.parentTransform * nodeTransform(node) : Mat4d::identity();
+        appendNodeMesh(visit.index, world);
+        pending.push_back({visit.index, world, true});
+        for (auto child = node.children.rbegin(); child != node.children.rend(); ++child) {
+            pending.push_back({*child, world, false});
+        }
+    }
     if (rawTriangles.empty() || rawVertices.empty()) {
         throw MeshLoadError("The selected glTF scene contains no triangle geometry");
     }
     const RawPatchConnectivity rawPatches = labelRawTrianglePatches(rawTriangles);
     result.mesh = weldAndPrepare(std::move(rawVertices),
                                  rawTriangles,
+                                 rawNormals,
                                  rawPatches.labels,
                                  rawPatches.count,
                                  options,
